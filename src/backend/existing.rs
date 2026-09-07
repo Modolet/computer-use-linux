@@ -120,6 +120,9 @@ impl Backend for Existing {
         if observation.target.id != self.target.id || !self.alive() {
             return Err(Fault::stale("应用引用失效"));
         }
+        if let Some(portal) = &self.portal {
+            portal.validate_binding()?;
+        }
         let niri_ipc::Response::Windows(windows) =
             super::desktop::niri_request(&self.niri, niri_ipc::Request::Windows)?
         else {
