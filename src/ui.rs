@@ -72,6 +72,25 @@ fn texture(png: &str) -> Option<gdk::Texture> {
 fn uncancelled() -> Cancellation {
     Cancellation::new(Arc::new(AtomicU64::new(0)))
 }
+fn capabilities_text(capabilities: &[String]) -> String {
+    capabilities
+        .iter()
+        .map(|c| match c.as_str() {
+            "screenshot" => "截图",
+            "accessibility_tree" => "读取控件",
+            "click" => "点击",
+            "drag" => "拖动",
+            "scroll" => "滚动",
+            "key" => "按键",
+            "text" => "文本输入",
+            "focus_window" => "切换窗口",
+            "set_text" => "编辑控件文本",
+            "invoke" => "控件动作",
+            _ => "未知能力",
+        })
+        .collect::<Vec<_>>()
+        .join("、")
+}
 
 pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
     let _enter = runtime.enter();
@@ -213,6 +232,11 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
                 }
                 ui.invalidate();
             }
+            let retained = std::mem::take(&mut ui.policy.lock().unwrap().retained);
+            if !retained.is_empty() {
+                ui.detached.borrow_mut().extend(retained);
+                ui.invalidate();
+            }
             ui.render();
             glib::ControlFlow::Continue
         });
@@ -260,14 +284,20 @@ impl Ui {
         for status in statuses {
             let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
             row.append(&label(&format!(
-                "{} · {} · {:?}",
+                "{} · {} · {}",
                 status.label.as_deref().unwrap_or("新的授权申请"),
                 match status.mode {
                     Mode::Isolated => "独立应用",
                     Mode::Existing => "已有应用",
                     Mode::Desktop => "整个电脑",
                 },
-                status.state
+                match status.state {
+                    State::Pending => "等待授权",
+                    State::Active => "AI 控制中",
+                    State::Paused => "已暂停",
+                    State::Denied => "已拒绝",
+                    State::Closed => "已结束",
+                }
             )));
             row.append(&label(&format!("会话 {}", status.session_id)));
             if let Some(message) = &status.message {
@@ -281,7 +311,7 @@ impl Ui {
                     row.append(&label(&format!("将授权：{}", prepared.label)));
                     row.append(&label(&format!(
                         "能力：{}",
-                        prepared.backend.capabilities().join("、")
+                        capabilities_text(&prepared.backend.capabilities())
                     )));
                     if let Some(png) = &prepared.preview
                         && let Some(t) = texture(png)
@@ -349,7 +379,7 @@ impl Ui {
             } else if matches!(status.state, State::Active | State::Paused) {
                 row.append(&label(&format!(
                     "已开放：{}",
-                    status.capabilities.join("、")
+                    capabilities_text(&status.capabilities)
                 )));
                 let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 row.append(&controls);
@@ -379,13 +409,7 @@ impl Ui {
                 button("撤销", &controls, move || {
                     if let Some(ui) = weak.upgrade() {
                         if let Some(handle) = ui.policy.lock().unwrap().close_local(&close_id) {
-                            if status.mode == Mode::Isolated {
-                                ui.detached
-                                    .borrow_mut()
-                                    .push(("已撤销的独立应用".into(), handle));
-                            } else {
-                                ipc::detach(handle);
-                            }
+                            ipc::detach(handle);
                         }
                         ui.invalidate();
                     }
@@ -602,6 +626,31 @@ fn preview(
         glib::Propagation::Proceed
     });
     let (action_sender, action_receiver) = mpsc::sync_channel::<(Action, Cancellation)>(128);
+    let text_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let entry = gtk::Entry::builder()
+        .placeholder_text("接管后可在这里使用中文输入法，再发送到应用")
+        .hexpand(true)
+        .build();
+    text_row.append(&entry);
+    let enabled = takeover.clone();
+    let text_sender = action_sender.clone();
+    let generation = manual_generation.clone();
+    button("发送文本", &text_row, move || {
+        if enabled.is_active()
+            && !entry.text().is_empty()
+            && text_sender
+                .try_send((
+                    Action::Text {
+                        text: entry.text().to_string(),
+                    },
+                    Cancellation::new(generation.clone()),
+                ))
+                .is_ok()
+        {
+            entry.set_text("");
+        }
+    });
+    outer.append(&text_row);
     let human_backend = backend.clone();
     std::thread::spawn(move || {
         while let Ok((action, cancel)) = action_receiver.recv() {
@@ -684,6 +733,37 @@ fn preview(
         }
     });
     picture.add_controller(gesture);
+    let position = Rc::new(Cell::new((0.0, 0.0)));
+    let motion = gtk::EventControllerMotion::new();
+    let pos = position.clone();
+    motion.connect_motion(move |_, x, y| pos.set((x, y)));
+    picture.add_controller(motion);
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    let enabled = takeover.clone();
+    let state = current.clone();
+    let pic = picture.clone();
+    let sender = action_sender.clone();
+    let generation = manual_generation.clone();
+    scroll.connect_scroll(move |_, dx, dy| {
+        if !enabled.is_active() {
+            return glib::Propagation::Proceed;
+        }
+        let (x, y) = position.get();
+        if let Some(o) = state.borrow().as_ref()
+            && let Some(at) = picture_point(&pic, o, x, y)
+        {
+            let _ = sender.try_send((
+                Action::Scroll {
+                    at,
+                    dx: (dx * 40.0).clamp(-1000.0, 1000.0),
+                    dy: (dy * 40.0).clamp(-1000.0, 1000.0),
+                },
+                Cancellation::new(generation.clone()),
+            ));
+        }
+        glib::Propagation::Stop
+    });
+    picture.add_controller(scroll);
     let key = gtk::EventControllerKey::new();
     let enable = takeover.clone();
     let generation = manual_generation.clone();
@@ -729,4 +809,153 @@ fn picture_point(picture: &gtk::Picture, o: &Observation, x: f64, y: f64) -> Opt
         y: (y - top) / scale,
     };
     (scale > 0.0 && p.x >= 0.0 && p.y >= 0.0 && p.x < w && p.y < h).then_some(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn pump(duration: Duration) {
+        let deadline = Instant::now() + duration;
+        let context = glib::MainContext::default();
+        while Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "只在专用测试 Wayland 桌面中运行 GTK 可见性验收"]
+    fn visible_window_allows_ai_and_closing_pauses() {
+        assert_eq!(std::env::var("COMPUTER_USE_UI_TEST").as_deref(), Ok("1"));
+        assert!(
+            std::env::var("WAYLAND_DISPLAY")
+                .unwrap()
+                .starts_with("/tmp/cv-"),
+            "请使用 tests/run-visual.sh 的专用测试桌面"
+        );
+        gtk::init().unwrap();
+        let app = gtk::Application::builder()
+            .application_id("io.github.computer_use_linux.UiTest")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let mut isolated = Isolated::launch(Application::TextEditor).unwrap();
+        let saved = isolated.saved.clone();
+        struct Cleanup(crate::backend::sway::SavedSession);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for p in [&self.0.app, &self.0.sway, &self.0.bus] {
+                    p.terminate();
+                }
+            }
+        }
+        let _cleanup = Cleanup(saved);
+        let o = isolated.observe(None, &uncancelled()).unwrap();
+        isolated
+            .act(
+                &o,
+                &Action::Text {
+                    text: "你好，这个应用始终可见。\nAI 在独立会话中操作；你可以继续使用其他窗口。"
+                        .into(),
+                },
+                &uncancelled(),
+            )
+            .unwrap();
+        let policy = Arc::new(Mutex::new(Policy::default()));
+        let owner = uuid::Uuid::new_v4();
+        let id = {
+            let mut p = policy.lock().unwrap();
+            p.register(owner);
+            let status = p
+                .request(
+                    owner,
+                    SessionRequest {
+                        scope: Scope::Application,
+                        mode: Mode::Isolated,
+                    },
+                )
+                .unwrap();
+            p.grant(
+                &status.session_id,
+                "GNOME Text Editor".into(),
+                Box::new(isolated),
+            )
+            .unwrap();
+            p.ui_visible = false;
+            status.session_id
+        };
+        let backend = policy.lock().unwrap().sessions[&id]
+            .backend
+            .clone()
+            .unwrap();
+        preview(&app, backend.clone(), policy.clone(), Some(id.clone()));
+        let window = app.windows().into_iter().next().unwrap();
+        policy.lock().unwrap().resume(&id).unwrap();
+        pump(Duration::from_secs(2));
+        assert!(window.is_visible() && window.is_mapped());
+        assert_eq!(
+            policy.lock().unwrap().status(owner, &id).unwrap().state,
+            State::Active
+        );
+        // The passive view refreshes concurrently without consuming AI authority.
+        let permit = policy.lock().unwrap().permit(owner, &id, None).unwrap();
+        let o = permit
+            .backend
+            .lock()
+            .unwrap()
+            .observe(None, &permit.cancel)
+            .unwrap();
+        policy
+            .lock()
+            .unwrap()
+            .remember(owner, &id, o.clone(), &permit.cancel)
+            .unwrap();
+        pump(Duration::from_millis(500));
+        let request = ActRequest {
+            session_id: id.clone(),
+            observation_id: o.observation_id.clone(),
+            target: o.target.id.clone(),
+            action: Action::Text {
+                text: "\n实时窗口打开时，AI 仍可继续输入。".into(),
+            },
+        };
+        let permit = policy
+            .lock()
+            .unwrap()
+            .action_permit(owner, &request)
+            .unwrap();
+        permit
+            .backend
+            .lock()
+            .unwrap()
+            .act(&o, &request.action, &permit.cancel)
+            .unwrap();
+        pump(Duration::from_secs(1));
+        if let Ok(path) = std::env::var("COMPUTER_USE_UI_PNG") {
+            let mut desktop = crate::backend::wayland::Wayland::connect(
+                &crate::backend::wayland::Wayland::host_path().unwrap(),
+                &uncancelled(),
+            )
+            .unwrap();
+            let output = desktop.outputs().into_iter().next().unwrap();
+            let (png, _, _) = desktop.capture(&output, &uncancelled()).unwrap();
+            std::fs::write(
+                path,
+                base64::engine::general_purpose::STANDARD
+                    .decode(png)
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        window.close();
+        pump(Duration::from_millis(100));
+        assert_eq!(
+            policy.lock().unwrap().status(owner, &id).unwrap().state,
+            State::Paused
+        );
+    }
 }

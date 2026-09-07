@@ -49,9 +49,31 @@ pub struct SavedSession {
     pub runtime: PathBuf,
     pub sway: ProcessIdentity,
     pub app: ProcessIdentity,
-    pub bus_pid: u32,
+    pub bus: ProcessIdentity,
     pub socket: PathBuf,
     pub wayland: PathBuf,
+}
+
+struct StartupGuard(Vec<ProcessIdentity>);
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        for process in self.0.iter().rev() {
+            process.terminate();
+        }
+    }
+}
+
+fn reap_session(saved: SavedSession) {
+    std::thread::spawn(move || {
+        while saved.app.alive() {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        // Never terminate a still-running application with unsaved work.
+        if !saved.app.alive() {
+            saved.sway.terminate();
+            saved.bus.terminate();
+        }
+    });
 }
 
 pub struct Isolated {
@@ -186,6 +208,8 @@ impl Isolated {
             .trim()
             .parse()
             .map_err(|_| Fault::unavailable("D-Bus 未返回进程号"))?;
+        let bus_identity = ProcessIdentity::read(bus_pid)?;
+        let mut startup = StartupGuard(vec![bus_identity.clone()]);
         let config = runtime.join("sway.config");
         fs::write(&config, "output HEADLESS-1 mode 1280x800\nseat seat0 fallback true\nfocus_on_window_activation none\nfocus_follows_mouse no\nfont monospace 10\nxwayland disable\ndefault_border none\n").map_err(|e| Fault::unavailable(e.to_string()))?;
         let log = fs::File::create(runtime.join("sway.log"))
@@ -201,6 +225,7 @@ impl Isolated {
             .stderr(log)
             .spawn()
             .map_err(|e| Fault::unavailable(format!("启动 Sway: {e}")))?;
+        startup.0.push(ProcessIdentity::read(sway.id())?);
         let deadline = Instant::now() + Duration::from_secs(12);
         let (wayland, socket) = loop {
             if sway
@@ -291,6 +316,7 @@ impl Isolated {
         let mut app = cmd
             .spawn()
             .map_err(|e| Fault::unavailable(format!("启动应用: {e}")))?;
+        startup.0.push(ProcessIdentity::read(app.id())?);
         let deadline = Instant::now() + Duration::from_secs(20);
         let identity = loop {
             if app
@@ -314,7 +340,7 @@ impl Isolated {
                 break ProcessIdentity::read(pid as u32)?;
             }
             if Instant::now() > deadline {
-                return Err(Fault::unavailable("应用未创建可验证窗口；保留进程以便检查"));
+                return Err(Fault::unavailable("应用未创建可验证窗口，启动失败"));
             }
             std::thread::sleep(Duration::from_millis(100));
         };
@@ -327,7 +353,7 @@ impl Isolated {
             runtime,
             sway: sway_identity,
             app: identity,
-            bus_pid,
+            bus: bus_identity,
             socket,
             wayland,
         };
@@ -343,6 +369,8 @@ impl Isolated {
             input,
         };
         result.check_windows()?;
+        startup.0.clear();
+        reap_session(result.saved.clone());
         Ok(result)
     }
     pub fn recover() -> Vec<Self> {
@@ -362,6 +390,7 @@ impl Isolated {
                 let mut input = Wayland::connect(&saved.wayland, &Self::cancel()).ok()?;
                 let output = input.outputs().into_iter().next()?;
                 input.initialize_input(&output, &Self::cancel()).ok()?;
+                reap_session(saved.clone());
                 Some(Self {
                     saved,
                     target_id: Uuid::new_v4().to_string(),
@@ -404,6 +433,19 @@ impl Isolated {
     fn cancel() -> Cancellation {
         Cancellation::new(Arc::new(AtomicU64::new(0)))
     }
+    fn scale(&self, output_name: &str) -> Result<f64> {
+        let outputs = sway_request(&self.saved.socket, 3, "")?;
+        outputs
+            .as_array()
+            .and_then(|outputs| {
+                outputs
+                    .iter()
+                    .find(|o| o["name"].as_str() == Some(output_name))
+            })
+            .and_then(|o| o["scale"].as_f64())
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .ok_or_else(|| Fault::stale("虚拟显示器缩放信息无效"))
+    }
 }
 
 impl Backend for Isolated {
@@ -438,7 +480,7 @@ impl Backend for Isolated {
             label: self.saved.application.label().into(),
             width: output.width,
             height: output.height,
-            scale: f64::from(output.scale),
+            scale: self.scale(&output.name)?,
         }])
     }
     fn observe(&mut self, target: Option<&str>, cancel: &Cancellation) -> Result<Observation> {
@@ -466,7 +508,7 @@ impl Backend for Isolated {
                 label: self.saved.application.label().into(),
                 width,
                 height,
-                scale: f64::from(output.scale),
+                scale: self.scale(&output.name)?,
             },
             png_base64: Some(png),
             nodes: vec![],
@@ -494,6 +536,9 @@ impl Backend for Isolated {
             .ok_or_else(|| Fault::stale("虚拟显示器消失"))?;
         if (output.width, output.height) != (observation.target.width, observation.target.height) {
             return Err(Fault::stale("虚拟显示器尺寸变化"));
+        }
+        if self.scale(&output.name)? != observation.target.scale {
+            return Err(Fault::stale("虚拟显示器缩放变化"));
         }
         self.input.input(
             &output,

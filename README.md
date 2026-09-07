@@ -125,6 +125,8 @@ cargo test --test headless -- --ignored --test-threads=1
 
 测试覆盖连接隔离、授权前拒绝、暂停与撤销、过期引用、可见视图门控、真实 stdio MCP、Firefox 和编辑器的文本与快捷键、独立会话剪贴板隔离、尺寸变化和取消。
 
+可见窗口验收使用另一套专用测试桌面：`nix develop --command bash tests/run-visual.sh`。验证 GTK 窗口确实映射、实时画面显示期间 AI 可以继续输入，以及关闭窗口后自动暂停。设置 `COMPUTER_USE_UI_PNG` 为绝对路径可保存该测试桌面的截图。
+
 宿主 niri 的 Portal 采集、整机虚拟输入、分数缩放、多显示器和持续人工操作验收仍需在目标桌面上验证。双独立会话测试不能代替真实宿主的人工无干扰验收。已有实例的后台写操作在通过具体应用构建和控件动作测试前保持禁用。
 
 参考协议：[Wayland 独立会话实践](https://github.com/any1/wayvnc/blob/master/FAQ.md)、[Portal ScreenCast](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html)、[niri IPC](https://docs.rs/niri-ipc/26.4.0/niri_ipc/)。

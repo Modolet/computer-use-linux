@@ -92,8 +92,18 @@ impl Desktop {
         })
     }
     fn topology(&self) -> Result<Value> {
-        let response = niri_request(&self.niri, niri_ipc::Request::Outputs)?;
-        serde_json::to_value(response).map_err(|e| Fault::unavailable(e.to_string()))
+        let outputs = niri_request(&self.niri, niri_ipc::Request::Outputs)?;
+        let niri_ipc::Response::Windows(mut windows) =
+            niri_request(&self.niri, niri_ipc::Request::Windows)?
+        else {
+            return Err(Fault::unavailable("无法检查窗口布局"));
+        };
+        windows.sort_by_key(|w| w.id);
+        let geometry: Vec<_> = windows
+            .into_iter()
+            .map(|w| serde_json::json!([w.id, w.pid, w.layout, w.is_focused]))
+            .collect();
+        Ok(serde_json::json!({"outputs": outputs, "windows": geometry}))
     }
     fn list_windows(&mut self) -> Result<Vec<Target>> {
         let niri_ipc::Response::Windows(windows) =
@@ -144,7 +154,7 @@ impl Backend for Desktop {
                     .entry(o.name.clone())
                     .or_insert_with(|| Uuid::new_v4().to_string())
                     .clone();
-                let scale = topology["Outputs"][&o.name]["logical"]["scale"]
+                let scale = topology["outputs"]["Outputs"][&o.name]["logical"]["scale"]
                     .as_f64()
                     .unwrap_or(f64::from(o.scale));
                 Target {
@@ -185,7 +195,7 @@ impl Backend for Desktop {
             return Err(Fault::stale("显示器布局变化，请重新观察"));
         }
         let windows = self.list_windows()?;
-        let scale = before["Outputs"][&name]["logical"]["scale"]
+        let scale = before["outputs"]["Outputs"][&name]["logical"]["scale"]
             .as_f64()
             .unwrap_or(f64::from(output.scale));
         self.geometry = Some(before);

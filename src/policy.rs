@@ -33,6 +33,7 @@ pub struct Policy {
     pub ui_visible: bool,
     pub ui_epoch: u64,
     pub manual_previews: usize,
+    pub retained: Vec<(String, BackendHandle)>,
     clients: HashSet<Uuid>,
 }
 
@@ -225,7 +226,16 @@ impl Policy {
         Self::stop(s, State::Closed);
         s.status.targets.clear();
         s.status.capabilities.clear();
-        s.backend.take()
+        let backend = s.backend.take();
+        if s.status.mode == Mode::Isolated
+            && let Some(handle) = &backend
+        {
+            self.retained.push((
+                s.status.label.clone().unwrap_or_else(|| "独立应用".into()),
+                handle.clone(),
+            ));
+        }
+        backend
     }
     pub fn disconnect(&mut self, owner: Uuid) -> Vec<BackendHandle> {
         self.clients.remove(&owner);
@@ -346,6 +356,14 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn disconnected_isolated_application_remains_available_only_locally() {
+        let (mut p, owner, id) = granted(Scope::Application, Mode::Isolated);
+        p.disconnect(owner);
+        assert_eq!(p.retained.len(), 1);
+        assert!(p.status(owner, &id).is_err());
+        assert!(p.permit(owner, &id, None).is_err());
     }
     #[test]
     fn visible_application_is_required_but_passive_view_does_not_pause() {

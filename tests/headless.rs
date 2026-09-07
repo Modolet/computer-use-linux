@@ -144,18 +144,9 @@ fn firefox_address_input_and_capture() {
 }
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        for identity in [&self.0.app, &self.0.sway] {
-            if identity.alive() {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(identity.pid as i32),
-                    nix::sys::signal::Signal::SIGTERM,
-                );
-            }
+        for identity in [&self.0.app, &self.0.sway, &self.0.bus] {
+            identity.terminate();
         }
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(self.0.bus_pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
     }
 }
 
@@ -262,4 +253,23 @@ fn isolated_text_capture_resize_and_cancellation() {
         backend.observe(None, &cancel).is_err(),
         "已撤销操作不可继续"
     );
+    let fresh = Cancellation::new(generation.clone());
+    let before_scale = backend.observe(None, &fresh).unwrap();
+    sway_request(&backend.saved.socket, 0, "output HEADLESS-1 scale 1.25").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(
+        backend
+            .act(
+                &before_scale,
+                &Action::Click {
+                    at: Point { x: 100.0, y: 100.0 },
+                    button: Button::Left
+                },
+                &fresh
+            )
+            .is_err()
+    );
+    let scaled = backend.observe(None, &fresh).unwrap();
+    assert_eq!(scaled.target.scale, 1.25);
+    assert_eq!((scaled.target.width, scaled.target.height), (1024, 768));
 }

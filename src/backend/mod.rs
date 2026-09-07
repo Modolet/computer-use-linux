@@ -5,6 +5,7 @@
 
 use crate::model::*;
 pub mod accessibility;
+mod cast_watch;
 pub mod desktop;
 pub mod existing;
 pub mod portal;

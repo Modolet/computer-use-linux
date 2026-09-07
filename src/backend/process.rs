@@ -4,7 +4,11 @@
 //! @date 2026-09-07
 use crate::model::*;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    path::PathBuf,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessIdentity {
@@ -35,6 +39,29 @@ impl ProcessIdentity {
     }
     pub fn alive(&self) -> bool {
         Self::read(self.pid).is_ok_and(|current| current == *self)
+    }
+    /// Cleanup uses a pidfd so a recycled PID can never receive the signal.
+    pub fn terminate(&self) -> bool {
+        // SAFETY: pidfd_open takes a numeric PID and flags, returning an owned fd.
+        let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, self.pid, 0) };
+        if fd < 0 {
+            return false;
+        }
+        // SAFETY: a successful pidfd_open returned this uniquely owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        if !self.alive() {
+            return false;
+        }
+        // SAFETY: the fd is live; a null siginfo requests a normal SIGTERM.
+        unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                nix::libc::SIGTERM,
+                std::ptr::null::<nix::libc::siginfo_t>(),
+                0,
+            ) == 0
+        }
     }
 }
 
@@ -73,5 +100,19 @@ mod tests {
         assert!(identity.alive());
         identity.start_time += 1;
         assert!(!identity.alive());
+    }
+    #[test]
+    fn cleanup_does_not_signal_a_different_lifetime() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let identity = ProcessIdentity::read(child.id()).unwrap();
+        let mut wrong = identity.clone();
+        wrong.start_time += 1;
+        assert!(!wrong.terminate());
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(identity.terminate());
+        assert!(!child.wait().unwrap().success());
     }
 }

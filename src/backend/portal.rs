@@ -25,6 +25,7 @@ pub struct Portal {
     pub source_id: Option<String>,
     node_id: u32,
     bound: Option<(std::path::PathBuf, u64, u64)>,
+    watch: Option<std::sync::Mutex<super::cast_watch::CastWatch>>,
 }
 
 struct PortalSession(Option<Session<Screencast>>);
@@ -119,6 +120,7 @@ impl Portal {
             source_id: stream.id().map(String::from),
             node_id: stream.pipe_wire_node_id(),
             bound: None,
+            watch: None,
         })
     }
     pub fn bind_window(&mut self, window_id: u64) -> Result<()> {
@@ -143,6 +145,9 @@ impl Portal {
                 "选择的截图窗口与授权应用不一致，或使用了动态共享目标",
             ));
         }
+        self.watch = Some(std::sync::Mutex::new(
+            super::cast_watch::CastWatch::connect(&path, matching[0].clone())?,
+        ));
         self.bound = Some((path, matching[0].stream_id, window_id));
         Ok(())
     }
@@ -164,6 +169,12 @@ impl Portal {
         }) {
             return Err(Fault::stale("窗口采集目标发生变化；必须重新授权"));
         }
+        self.watch
+            .as_ref()
+            .ok_or_else(|| Fault::denied("窗口流没有生命周期监视"))?
+            .lock()
+            .map_err(|_| Fault::stale("窗口流监视已退出"))?
+            .drain()?;
         Ok(())
     }
     pub fn capture(&self, cancel: &Cancellation) -> Result<(String, u32, u32)> {
