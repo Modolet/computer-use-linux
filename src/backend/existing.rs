@@ -18,6 +18,7 @@ pub struct Existing {
     niri: std::path::PathBuf,
     process: super::process::ProcessIdentity,
     window_id: u64,
+    geometry: Option<niri_ipc::WindowLayout>,
 }
 impl Existing {
     pub fn bind(candidate: Candidate, mut portal: Option<Portal>) -> Result<Self> {
@@ -44,7 +45,19 @@ impl Existing {
             niri,
             process,
             window_id,
+            geometry: None,
         })
+    }
+    fn window(&self) -> Result<niri_ipc::Window> {
+        let niri_ipc::Response::Windows(windows) =
+            super::desktop::niri_request(&self.niri, niri_ipc::Request::Windows)?
+        else {
+            return Err(Fault::stale("窗口状态不可用"));
+        };
+        windows
+            .into_iter()
+            .find(|w| w.id == self.window_id && w.pid == Some(self.process.pid as i32))
+            .ok_or_else(|| Fault::stale("应用窗口已退出"))
     }
 }
 impl Backend for Existing {
@@ -69,11 +82,15 @@ impl Backend for Existing {
         if target.is_some_and(|id| id != self.target.id) {
             return Err(Fault::denied("目标不属于获准应用"));
         }
+        let before = self.window()?.layout;
         let nodes = self.accessibility.read(cancel)?;
         let png = if let Some(portal) = &self.portal {
             let (png, width, height) = portal.capture(cancel)?;
             self.target.width = width;
             self.target.height = height;
+            if before.window_size.0 > 0 {
+                self.target.scale = f64::from(width) / f64::from(before.window_size.0);
+            }
             Some(png)
         } else {
             None
@@ -81,6 +98,10 @@ impl Backend for Existing {
         if !self.alive() {
             return Err(Fault::stale("采集期间应用已退出"));
         }
+        if self.window()?.layout != before {
+            return Err(Fault::stale("采集期间应用窗口尺寸或位置改变"));
+        }
+        self.geometry = Some(before);
         cancel.check()?;
         Ok(Observation {
             observation_id: Uuid::new_v4().to_string(),
@@ -114,7 +135,12 @@ impl Backend for Existing {
         if own[0].is_focused {
             return Err(Fault::new(ErrorCode::Paused, "用户正在使用目标窗口"));
         }
-        self.accessibility.act(action, cancel)
+        if self.geometry.as_ref() != Some(&own[0].layout) {
+            return Err(Fault::stale("应用窗口布局改变，请重新观察"));
+        }
+        let result = self.accessibility.act(action, cancel);
+        self.geometry = None;
+        result
     }
     fn alive(&mut self) -> bool {
         if !self.accessibility.alive() {

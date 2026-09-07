@@ -79,7 +79,7 @@ fn reap_session(saved: SavedSession) {
 pub struct Isolated {
     pub saved: SavedSession,
     target_id: String,
-    geometry: Option<String>,
+    geometry: Option<(String, u64)>,
     input: Wayland,
 }
 
@@ -401,10 +401,13 @@ impl Isolated {
             .collect()
     }
     fn check_windows(&self) -> Result<String> {
-        if !self.saved.sway.alive() || !self.saved.app.alive() {
+        Self::check_saved_windows(&self.saved)
+    }
+    fn check_saved_windows(saved: &SavedSession) -> Result<String> {
+        if !saved.sway.alive() || !saved.app.alive() {
             return Err(Fault::stale("独立应用或合成器已退出"));
         }
-        let tree = sway_request(&self.saved.socket, 4, "")?;
+        let tree = sway_request(&saved.socket, 4, "")?;
         let mut list = vec![];
         windows(&tree, &mut list);
         if list.is_empty() {
@@ -414,9 +417,7 @@ impl Isolated {
         for window in list {
             let pid = window["pid"].as_u64().unwrap() as u32;
             let identity = ProcessIdentity::read(pid)?;
-            if !descendant(pid, self.saved.app.pid)
-                || identity.executable != self.saved.app.executable
-            {
+            if !descendant(pid, saved.app.pid) || identity.executable != saved.app.executable {
                 return Err(Fault::denied(
                     "独立会话出现未授权应用窗口；暂停观察和输入，请在本地接管处理",
                 ));
@@ -428,6 +429,23 @@ impl Isolated {
                 identity
             ]));
         }
+        let outputs = sway_request(&saved.socket, 3, "")?;
+        let outputs: Vec<_> = outputs
+            .as_array()
+            .ok_or_else(|| Fault::stale("虚拟输出列表无效"))?
+            .iter()
+            .map(|o| {
+                serde_json::json!([
+                    o["name"],
+                    o["rect"],
+                    o["scale"],
+                    o["transform"],
+                    o["current_mode"],
+                    o["active"]
+                ])
+            })
+            .collect();
+        signature.push(serde_json::json!(outputs));
         Ok(serde_json::to_string(&signature).unwrap())
     }
     fn cancel() -> Cancellation {
@@ -486,8 +504,8 @@ impl Backend for Isolated {
         Ok(vec![Target {
             id: self.target_id.clone(),
             label: self.saved.application.label().into(),
-            width: output.width,
-            height: output.height,
+            width: output.image_size().0,
+            height: output.image_size().1,
             scale: self.scale(&output.name)?,
         }])
     }
@@ -508,7 +526,7 @@ impl Backend for Isolated {
         if before != after {
             return Err(Fault::stale("截图期间窗口布局改变，请重新观察"));
         }
-        self.geometry = Some(after);
+        self.geometry = Some((after, self.input.revision()));
         Ok(Observation {
             observation_id: Uuid::new_v4().to_string(),
             target: Target {
@@ -530,8 +548,9 @@ impl Backend for Isolated {
         cancel: &Cancellation,
     ) -> Result<()> {
         cancel.check()?;
+        self.input.refresh(cancel)?;
         if observation.target.id != self.target_id
-            || self.geometry.as_ref() != Some(&self.check_windows()?)
+            || self.geometry.as_ref() != Some(&(self.check_windows()?, self.input.revision()))
         {
             return Err(Fault::stale("窗口身份或布局变化，请重新观察"));
         }
@@ -542,17 +561,19 @@ impl Backend for Isolated {
             .into_iter()
             .next()
             .ok_or_else(|| Fault::stale("虚拟显示器消失"))?;
-        if (output.width, output.height) != (observation.target.width, observation.target.height) {
+        if output.image_size() != (observation.target.width, observation.target.height) {
             return Err(Fault::stale("虚拟显示器尺寸变化"));
         }
         if self.scale(&output.name)? != observation.target.scale {
             return Err(Fault::stale("虚拟显示器缩放变化"));
         }
-        self.input.input(
+        let saved = self.saved.clone();
+        self.input.input_checked(
             &output,
             (observation.target.width, observation.target.height),
             action,
             cancel,
+            &mut || Self::check_saved_windows(&saved).map(|_| ()),
         )?;
         self.geometry = None;
         Ok(())

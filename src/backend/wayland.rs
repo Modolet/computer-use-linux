@@ -36,6 +36,7 @@ use wayland_protocols_wlr::{
 #[derive(Clone, Debug)]
 pub struct Output {
     pub proxy: wl_output::WlOutput,
+    pub global: u32,
     pub name: String,
     pub width: u32,
     pub height: u32,
@@ -43,9 +44,26 @@ pub struct Output {
     pub transform: wl_output::Transform,
 }
 
+impl Output {
+    pub fn image_size(&self) -> (u32, u32) {
+        if matches!(
+            self.transform,
+            wl_output::Transform::_90
+                | wl_output::Transform::_270
+                | wl_output::Transform::Flipped90
+                | wl_output::Transform::Flipped270
+        ) {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
+    }
+}
+
 #[derive(Default)]
 struct WireState {
     outputs: BTreeMap<u32, Output>,
+    revision: u64,
     seat: Option<wl_seat::WlSeat>,
     shm: Option<wl_shm::WlShm>,
     copy: Option<copy::ZwlrScreencopyManagerV1>,
@@ -62,6 +80,7 @@ pub struct Wayland {
     connection: Connection,
     queue: EventQueue<WireState>,
     state: WireState,
+    input_output: Option<u32>,
     input_devices: Option<(
         pointer::ZwlrVirtualPointerV1,
         keyboard::ZwpVirtualKeyboardV1,
@@ -95,6 +114,7 @@ impl Wayland {
             queue,
             state: WireState::default(),
             input_devices: None,
+            input_output: None,
         };
         this.sync(cancel)?;
         this.sync(cancel)?;
@@ -138,14 +158,20 @@ impl Wayland {
         }
         Ok(())
     }
+    pub fn revision(&self) -> u64 {
+        self.state.revision
+    }
     pub fn outputs(&self) -> Vec<Output> {
         self.state.outputs.values().cloned().collect()
     }
     pub fn refresh(&mut self, cancel: &Cancellation) -> Result<()> {
+        self.sync(cancel)?;
+        // Hot-plug registry events create wl_output bindings. Receive their
+        // initial geometry/name events before publishing the new target.
         self.sync(cancel)
     }
     pub fn initialize_input(&mut self, output: &Output, cancel: &Cancellation) -> Result<()> {
-        if self.input_devices.is_some() {
+        if self.input_devices.is_some() && self.input_output == Some(output.global) {
             return Ok(());
         }
         if !self.input_supported() {
@@ -159,21 +185,27 @@ impl Wayland {
             .as_ref()
             .unwrap()
             .create_virtual_pointer_with_output(Some(seat), Some(&output.proxy), &qh, ());
-        let keyboard = self
-            .state
-            .keyboards
-            .as_ref()
-            .unwrap()
-            .create_virtual_keyboard(seat, &qh, ());
+        let keyboard = if let Some((old_pointer, keyboard)) = self.input_devices.take() {
+            old_pointer.destroy();
+            keyboard
+        } else {
+            self.state
+                .keyboards
+                .as_ref()
+                .unwrap()
+                .create_virtual_keyboard(seat, &qh, ())
+        };
         let guard = InputGuard {
             pointer: pointer.clone(),
             keyboard: keyboard.clone(),
             connection: self.connection.clone(),
+            transform: output.transform,
             buttons: vec![],
             keys: vec![],
         };
         let _map = guard.keymap(&["a".into()])?;
         self.input_devices = Some((pointer, keyboard));
+        self.input_output = Some(output.global);
         self.sync(cancel)
     }
     pub fn input_supported(&self) -> bool {
@@ -281,24 +313,52 @@ impl Wayland {
         action: &Action,
         cancel: &Cancellation,
     ) -> Result<()> {
+        self.input_checked(output, size, action, cancel, &mut || Ok(()))
+    }
+    pub fn input_checked(
+        &mut self,
+        output: &Output,
+        size: (u32, u32),
+        action: &Action,
+        cancel: &Cancellation,
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
         cancel.check()?;
+        validate()?;
         if !self.input_supported() {
             return Err(Fault::unsupported("合成器缺少虚拟输入协议"));
         }
+        let revision = self.revision();
         self.initialize_input(output, cancel)?;
+        if revision != self.revision() {
+            return Err(Fault::stale("输入设备初始化期间显示器变化"));
+        }
+        validate()?;
         let (p, k) = self.input_devices.as_ref().unwrap().clone();
         let mut input = InputGuard {
             pointer: p,
             keyboard: k,
             connection: self.connection.clone(),
+            transform: output.transform,
             buttons: vec![],
             keys: vec![],
         };
-        let result = input.perform(size, action, cancel, &mut || self.sync(cancel));
+        let result = input.perform(size, action, cancel, &mut || {
+            self.sync(cancel)?;
+            if self.revision() != revision {
+                return Err(Fault::stale("输入期间显示器变化"));
+            }
+            validate()
+        });
         // Drop sends release events even on cancellation or protocol failure.
         drop(input);
+        // A cancelled generation must still complete the release round-trip.
+        // Disconnecting before the compositor receives it can leave a grab held.
+        let released = self.sync(&Cancellation::new(std::sync::Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        )));
         result?;
-        self.sync(cancel)
+        released
     }
 }
 
@@ -353,10 +413,44 @@ fn decode_shm(
     Ok(result)
 }
 
+fn input_position(point: Point, size: (u32, u32), transform: wl_output::Transform) -> (u32, u32) {
+    let x = point.x / f64::from(size.0);
+    let y = point.y / f64::from(size.1);
+    let (x, y) = match transform {
+        wl_output::Transform::_90 => (y, 1.0 - x),
+        wl_output::Transform::_180 => (1.0 - x, 1.0 - y),
+        wl_output::Transform::_270 => (1.0 - y, x),
+        wl_output::Transform::Flipped => (1.0 - x, y),
+        wl_output::Transform::Flipped90 => (1.0 - y, 1.0 - x),
+        wl_output::Transform::Flipped180 => (x, 1.0 - y),
+        wl_output::Transform::Flipped270 => (y, x),
+        _ => (x, y),
+    };
+    (
+        (x * 1_000_000.0).round() as u32,
+        (y * 1_000_000.0).round() as u32,
+    )
+}
+
+fn wheel_steps(value: f64) -> i32 {
+    let steps = (value / 15.0).round() as i32;
+    if steps == 0 {
+        value.signum() as i32
+    } else {
+        steps
+    }
+}
+
+fn event_time() -> u32 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    (START.get_or_init(Instant::now).elapsed().as_millis() as u32).wrapping_add(1)
+}
+
 struct InputGuard {
     pointer: pointer::ZwlrVirtualPointerV1,
     keyboard: keyboard::ZwpVirtualKeyboardV1,
     connection: Connection,
+    transform: wl_output::Transform,
     buttons: Vec<u32>,
     keys: Vec<u32>,
 }
@@ -367,24 +461,20 @@ impl InputGuard {
             .map_err(|e| Fault::unavailable(e.to_string()))
     }
     fn motion(&self, point: Point, size: (u32, u32)) {
-        self.pointer.motion_absolute(
-            0,
-            point.x.round() as u32,
-            point.y.round() as u32,
-            size.0,
-            size.1,
-        );
+        let (x, y) = input_position(point, size, self.transform);
+        self.pointer
+            .motion_absolute(event_time(), x, y, 1_000_000, 1_000_000);
         self.pointer.frame();
     }
     fn press(&mut self, button: u32) {
         self.buttons.push(button);
         self.pointer
-            .button(0, button, wl_pointer::ButtonState::Pressed);
+            .button(event_time(), button, wl_pointer::ButtonState::Pressed);
         self.pointer.frame();
     }
     fn release(&mut self, button: u32) {
         self.pointer
-            .button(0, button, wl_pointer::ButtonState::Released);
+            .button(event_time(), button, wl_pointer::ButtonState::Released);
         self.pointer.frame();
         self.buttons.retain(|b| *b != button);
     }
@@ -412,6 +502,7 @@ impl InputGuard {
         match action {
             Action::Click { at, button } => {
                 self.motion(*at, size);
+                sync()?;
                 cancel.check()?;
                 let b = match button {
                     Button::Left => 0x110,
@@ -419,12 +510,16 @@ impl InputGuard {
                     Button::Middle => 0x112,
                 };
                 self.press(b);
-                self.flush()?;
+                sync()?;
+                std::thread::sleep(Duration::from_millis(20));
+                cancel.check()?;
                 self.release(b);
             }
             Action::Drag { from, to } => {
                 self.motion(*from, size);
+                sync()?;
                 self.press(0x110);
+                sync()?;
                 for i in 1..=30 {
                     cancel.check()?;
                     let t = f64::from(i) / 30.0;
@@ -435,21 +530,31 @@ impl InputGuard {
                         },
                         size,
                     );
-                    self.flush()?;
+                    sync()?;
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 self.release(0x110);
             }
             Action::Scroll { at, dx, dy } => {
                 self.motion(*at, size);
+                sync()?;
                 cancel.check()?;
                 self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
                 if *dy != 0.0 {
-                    self.pointer.axis(0, wl_pointer::Axis::VerticalScroll, *dy);
+                    self.pointer.axis_discrete(
+                        event_time(),
+                        wl_pointer::Axis::VerticalScroll,
+                        *dy,
+                        wheel_steps(*dy),
+                    );
                 }
                 if *dx != 0.0 {
-                    self.pointer
-                        .axis(0, wl_pointer::Axis::HorizontalScroll, *dx);
+                    self.pointer.axis_discrete(
+                        event_time(),
+                        wl_pointer::Axis::HorizontalScroll,
+                        *dx,
+                        wheel_steps(*dx),
+                    );
                 }
                 self.pointer.frame();
             }
@@ -469,11 +574,11 @@ impl InputGuard {
                     sync()?;
                     for i in 0..chunk.len() {
                         cancel.check()?;
-                        self.keyboard.key(0, i as u32 + 30, 1);
+                        self.keyboard.key(event_time(), i as u32 + 30, 1);
                         self.keys.push(i as u32 + 30);
                         sync()?;
                         std::thread::sleep(Duration::from_millis(2));
-                        self.keyboard.key(0, i as u32 + 30, 0);
+                        self.keyboard.key(event_time(), i as u32 + 30, 0);
                         self.keys.clear();
                         sync()?;
                         std::thread::sleep(Duration::from_millis(2));
@@ -496,10 +601,10 @@ impl InputGuard {
                 self.keyboard.modifiers(mask, 0, 0, 0);
                 sync()?;
                 self.keys.push(30);
-                self.keyboard.key(0, 30, 1);
+                self.keyboard.key(event_time(), 30, 1);
                 sync()?;
                 std::thread::sleep(Duration::from_millis(2));
-                self.keyboard.key(0, 30, 0);
+                self.keyboard.key(event_time(), 30, 0);
                 self.keys.clear();
                 self.keyboard.modifiers(0, 0, 0, 0);
             }
@@ -511,7 +616,7 @@ impl InputGuard {
 impl Drop for InputGuard {
     fn drop(&mut self) {
         for key in &self.keys {
-            self.keyboard.key(0, *key, 0);
+            self.keyboard.key(event_time(), *key, 0);
         }
         self.keyboard.modifiers(0, 0, 0, 0);
         for button in &self.buttons {
@@ -612,6 +717,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WireState {
                         name,
                         Output {
                             proxy,
+                            global: name,
                             name: format!("output-{name}"),
                             width: 0,
                             height: 0,
@@ -635,8 +741,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WireState {
                 }
                 _ => {}
             },
-            wl_registry::Event::GlobalRemove { name } => {
-                state.outputs.remove(&name);
+            wl_registry::Event::GlobalRemove { name } if state.outputs.remove(&name).is_some() => {
+                state.revision = state.revision.wrapping_add(1);
             }
             _ => {}
         }
@@ -652,6 +758,13 @@ impl Dispatch<wl_output::WlOutput, u32> for WireState {
         _: &QueueHandle<Self>,
     ) {
         if let Some(output) = state.outputs.get_mut(id) {
+            let before = (
+                output.name.clone(),
+                output.width,
+                output.height,
+                output.scale,
+                output.transform,
+            );
             match event {
                 wl_output::Event::Name { name } => output.name = name,
                 wl_output::Event::Mode {
@@ -669,6 +782,16 @@ impl Dispatch<wl_output::WlOutput, u32> for WireState {
                     ..
                 } => output.transform = transform,
                 _ => {}
+            }
+            let after = (
+                output.name.clone(),
+                output.width,
+                output.height,
+                output.scale,
+                output.transform,
+            );
+            if before != after {
+                state.revision = state.revision.wrapping_add(1);
             }
         }
     }

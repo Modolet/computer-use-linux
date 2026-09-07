@@ -232,8 +232,8 @@ impl Accessibility {
             None
         };
         let id = Uuid::new_v4().to_string();
-        let editable = super::verified::editor(&self.candidate)
-            && super::verified::editable(&role, &interfaces, &states)
+        let editable = super::verified::editable(&role, &interfaces, &states)
+            && super::verified::editor(&self.candidate)
             && text
                 .as_ref()
                 .is_some_and(|text| text.chars().count() < 4096);

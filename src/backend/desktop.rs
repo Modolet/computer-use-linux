@@ -43,7 +43,9 @@ pub fn niri_request(
 }
 
 pub struct Desktop {
-    wayland: PathBuf,
+    wire: Wayland,
+    output_globals: HashMap<String, u32>,
+    output_revision: Option<u64>,
     niri: PathBuf,
     compositor: ProcessIdentity,
     output_ids: HashMap<String, String>,
@@ -76,13 +78,20 @@ impl Desktop {
                     .map(String::from),
             );
         }
+        let output_globals = wire
+            .outputs()
+            .into_iter()
+            .map(|o| (o.name, o.global))
+            .collect();
         let output_ids = wire
             .outputs()
             .into_iter()
             .map(|o| (o.name, Uuid::new_v4().to_string()))
             .collect();
         Ok(Self {
-            wayland,
+            wire,
+            output_globals,
+            output_revision: None,
             niri,
             compositor,
             output_ids,
@@ -90,6 +99,20 @@ impl Desktop {
             geometry: None,
             capabilities,
         })
+    }
+    fn refresh_outputs(&mut self, cancel: &Cancellation) -> Result<()> {
+        self.wire.refresh(cancel)?;
+        let outputs = self.wire.outputs();
+        self.output_ids
+            .retain(|name, _| outputs.iter().any(|o| &o.name == name));
+        for output in outputs {
+            if self.output_globals.get(&output.name) != Some(&output.global) {
+                self.output_ids
+                    .insert(output.name.clone(), Uuid::new_v4().to_string());
+            }
+            self.output_globals.insert(output.name, output.global);
+        }
+        Ok(())
     }
     fn topology(&self) -> Result<Value> {
         let outputs = niri_request(&self.niri, niri_ipc::Request::Outputs)?;
@@ -143,9 +166,10 @@ impl Backend for Desktop {
     }
     fn targets(&mut self) -> Result<Vec<Target>> {
         let cancel = Cancellation::new(Arc::new(AtomicU64::new(0)));
-        let wire = Wayland::connect(&self.wayland, &cancel)?;
+        self.refresh_outputs(&cancel)?;
         let topology = self.topology()?;
-        Ok(wire
+        Ok(self
+            .wire
             .outputs()
             .into_iter()
             .map(|o| {
@@ -159,9 +183,9 @@ impl Backend for Desktop {
                     .unwrap_or(f64::from(o.scale));
                 Target {
                     id,
+                    width: o.image_size().0,
+                    height: o.image_size().1,
                     label: o.name,
-                    width: o.width,
-                    height: o.height,
                     scale,
                 }
             })
@@ -171,6 +195,8 @@ impl Backend for Desktop {
         if !self.alive() {
             return Err(Fault::stale("niri 会话已经退出"));
         }
+        self.refresh_outputs(cancel)?;
+        let revision = self.wire.revision();
         let name = match target {
             Some(id) => self
                 .output_ids
@@ -188,10 +214,9 @@ impl Backend for Desktop {
             }
         };
         let before = self.topology()?;
-        let mut wire = Wayland::connect(&self.wayland, cancel)?;
-        let output = wire.output(&name)?;
-        let (png, width, height) = wire.capture(&output, cancel)?;
-        if before != self.topology()? {
+        let output = self.wire.output(&name)?;
+        let (png, width, height) = self.wire.capture(&output, cancel)?;
+        if before != self.topology()? || revision != self.wire.revision() {
             return Err(Fault::stale("显示器布局变化，请重新观察"));
         }
         let windows = self.list_windows()?;
@@ -199,6 +224,7 @@ impl Backend for Desktop {
             .as_f64()
             .unwrap_or(f64::from(output.scale));
         self.geometry = Some(before);
+        self.output_revision = Some(revision);
         Ok(Observation {
             observation_id: Uuid::new_v4().to_string(),
             target: Target {
@@ -223,7 +249,10 @@ impl Backend for Desktop {
         if !self.alive() {
             return Err(Fault::stale("niri 会话已经退出"));
         }
-        if self.geometry.as_ref() != Some(&self.topology()?) {
+        self.refresh_outputs(cancel)?;
+        if self.geometry.as_ref() != Some(&self.topology()?)
+            || self.output_revision != Some(self.wire.revision())
+        {
             return Err(Fault::stale("显示器布局变化，请重新观察"));
         }
         if let Action::FocusWindow { window } = action {
@@ -247,9 +276,8 @@ impl Backend for Desktop {
                 .find(|(_, id)| **id == observation.target.id)
                 .map(|(name, _)| name.clone())
                 .ok_or_else(|| Fault::stale("显示器引用失效"))?;
-            let mut wire = Wayland::connect(&self.wayland, cancel)?;
-            let output = wire.output(&name)?;
-            wire.input(
+            let output = self.wire.output(&name)?;
+            self.wire.input(
                 &output,
                 (observation.target.width, observation.target.height),
                 action,

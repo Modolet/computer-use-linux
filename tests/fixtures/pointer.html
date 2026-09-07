@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- @file pointer.html
+     @brief Firefox 真实图像坐标与输入验收页面
+     @author modolet <y@xxyx.io>
+     @date 2026-09-07 -->
+<meta charset="utf-8">
+<title>pointer ready</title>
+<style>
+  body { margin: 0; height: 4000px; background: white; }
+  #target { position: absolute; left: 100px; top: 80px; width: 200px;
+    height: 100px; background: rgb(255, 0, 0); touch-action: none; }
+</style>
+<div id="target"></div>
+<script>
+  const target = document.getElementById('target');
+  target.addEventListener('pointerdown', event => {
+    target.setPointerCapture(event.pointerId);
+    document.title = `pressed ${Math.round(event.clientX)} ${Math.round(event.clientY)}`;
+  });
+  target.addEventListener('pointerup', event => {
+    document.title = `released ${Math.round(event.clientX)} ${Math.round(event.clientY)}`;
+  });
+  window.addEventListener('scroll', () => { document.title = `scroll ${Math.round(scrollY)}`; });
+</script>

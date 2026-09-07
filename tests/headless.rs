@@ -273,3 +273,198 @@ fn isolated_text_capture_resize_and_cancellation() {
     assert_eq!(scaled.target.scale, 1.25);
     assert_eq!((scaled.target.width, scaled.target.height), (1024, 768));
 }
+
+#[test]
+#[ignore = "独立 Firefox 中按真实像素验证旋转、缩放与鼠标输入"]
+fn pointer_coordinates_follow_visible_pixels() {
+    assert_eq!(
+        std::env::var("COMPUTER_USE_HEADLESS_TEST").as_deref(),
+        Ok("1")
+    );
+    let mut browser = Isolated::launch(Application::Firefox).unwrap();
+    let _cleanup = Cleanup(browser.saved.clone());
+    key(&mut browser, "l");
+    act(
+        &mut browser,
+        Action::Text {
+            text: format!(
+                "file://{}/tests/fixtures/pointer.html",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+        },
+    );
+    act(
+        &mut browser,
+        Action::Key {
+            key: "Enter".into(),
+            modifiers: vec![],
+        },
+    );
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    for transform in [
+        "normal",
+        "90",
+        "180",
+        "270",
+        "flipped",
+        "flipped-90",
+        "flipped-180",
+        "flipped-270",
+    ] {
+        sway_request(
+            &browser.saved.socket,
+            0,
+            &format!("output HEADLESS-1 transform {transform}"),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        key(&mut browser, "r");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            sway_request(&browser.saved.socket, 4, "")
+                .unwrap()
+                .to_string()
+                .contains("pointer ready")
+        );
+        let c = Cancellation::new(Arc::new(AtomicU64::new(0)));
+        let o = browser.observe(None, &c).unwrap();
+        let at = red_center(&o);
+        browser
+            .act(
+                &o,
+                &Action::Click {
+                    at,
+                    button: Button::Left,
+                },
+                &c,
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let tree = sway_request(&browser.saved.socket, 4, "").unwrap();
+        assert!(
+            tree.to_string().contains("released 200 130"),
+            "{transform}: {tree}"
+        );
+    }
+    sway_request(
+        &browser.saved.socket,
+        0,
+        "output HEADLESS-1 transform normal scale 1.25",
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let c = Cancellation::new(Arc::new(AtomicU64::new(0)));
+    let o = browser.observe(None, &c).unwrap();
+    let at = red_center(&o);
+    browser
+        .act(
+            &o,
+            &Action::Click {
+                at,
+                button: Button::Left,
+            },
+            &c,
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        sway_request(&browser.saved.socket, 4, "")
+            .unwrap()
+            .to_string()
+            .contains("released 200 130")
+    );
+    act(
+        &mut browser,
+        Action::Scroll {
+            at,
+            dx: 0.0,
+            dy: 150.0,
+        },
+    );
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(
+        sway_request(&browser.saved.socket, 4, "")
+            .unwrap()
+            .to_string()
+            .contains("scroll ")
+    );
+}
+fn red_center(o: &Observation) -> Point {
+    use base64::Engine;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(o.png_base64.as_ref().unwrap())
+        .unwrap();
+    let image = image::load_from_memory(&png).unwrap().to_rgb8();
+    let mut bounds = (u32::MAX, u32::MAX, 0, 0);
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel.0 == [255, 0, 0] {
+            bounds.0 = bounds.0.min(x);
+            bounds.1 = bounds.1.min(y);
+            bounds.2 = bounds.2.max(x);
+            bounds.3 = bounds.3.max(y);
+        }
+    }
+    assert!(bounds.0 < bounds.2, "测试页面红色目标没有显示");
+    Point {
+        x: f64::from(bounds.0 + bounds.2 + 1) / 2.0,
+        y: f64::from(bounds.1 + bounds.3 + 1) / 2.0,
+    }
+}
+
+#[test]
+#[ignore = "长输入期间出现其他进程窗口时必须停止"]
+fn foreign_window_interrupts_inflight_isolated_input() {
+    assert_eq!(
+        std::env::var("COMPUTER_USE_HEADLESS_TEST").as_deref(),
+        Ok("1")
+    );
+    let mut app = Isolated::launch(Application::TextEditor).unwrap();
+    let _cleanup = Cleanup(app.saved.clone());
+    key(&mut app, "n");
+    let saved = app.saved.clone();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let c = Cancellation::new(Arc::new(AtomicU64::new(0)));
+    let o = app.observe(None, &c).unwrap();
+    let worker = std::thread::spawn(move || {
+        let result = app.act(
+            &o,
+            &Action::Text {
+                text: "x".repeat(1000),
+            },
+            &c,
+        );
+        (app, result)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut other = std::process::Command::new("gnome-text-editor")
+        .arg("--standalone")
+        .env("XDG_RUNTIME_DIR", &saved.runtime)
+        .env("WAYLAND_DISPLAY", &saved.wayland)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/bus", saved.runtime.display()),
+        )
+        .env("GDK_BACKEND", "wayland")
+        .env("GTK_A11Y", "none")
+        .env("GSK_RENDERER", "cairo")
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let (mut app, result) = worker.join().unwrap();
+    assert_eq!(result.unwrap_err().code, ErrorCode::PermissionDenied);
+    assert_eq!(
+        app.observe(None, &Cancellation::new(Arc::new(AtomicU64::new(0))))
+            .unwrap_err()
+            .code,
+        ErrorCode::PermissionDenied
+    );
+    computer_use_linux::backend::process::ProcessIdentity::read(other.id())
+        .unwrap()
+        .terminate();
+    other.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        app.observe(None, &Cancellation::new(Arc::new(AtomicU64::new(0))))
+            .is_ok()
+    );
+}
