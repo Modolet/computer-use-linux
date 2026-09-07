@@ -1,0 +1,30 @@
+[package]
+name = "computer-use-linux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio"] }
+base64 = "0.23.1"
+clap = { version = "4.6.6", features = ["derive"] }
+fs2 = "0.4.3"
+gstreamer = "0.25.3"
+gstreamer-app = "0.25.2"
+gtk4 = "0.11.4"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+nix = { version = "0.31.3", features = ["fs", "socket", "poll", "process", "signal", "user"] }
+rmcp = { version = "3.2.0", features = ["server", "transport-io", "schemars"] }
+schemars = { version = "1.2.2", features = ["uuid1"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+uuid = { version = "1.26.0", features = ["v4", "serde"] }
+wayland-client = "0.31.15"
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+zbus = { version = "5.19.0", features = ["blocking"] }
