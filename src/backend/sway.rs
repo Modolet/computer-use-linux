@@ -214,8 +214,10 @@ impl Isolated {
             .map_err(|e| Fault::unavailable(e.to_string()))?;
         let bus = format!("unix:path={}/bus", runtime.display());
         let bus_config = runtime.join("dbus.conf");
-        fs::write(&bus_config,format!("<busconfig><type>session</type><listen>{bus}</listen><auth>EXTERNAL</auth><policy context=\"default\"><allow user=\"{}\"/><allow own=\"*\"/><allow send_destination=\"*\"/><allow receive_sender=\"*\"/></policy></busconfig>",nix::unistd::getuid())).map_err(|e| Fault::unavailable(e.to_string()))?;
-        let bus_output = Command::new("dbus-daemon")
+        // Activate settings services (such as dconf) against the same personal
+        // data, but keep service activation inside this graphical session.
+        fs::write(&bus_config,format!("<busconfig><type>session</type><listen>{bus}</listen><auth>EXTERNAL</auth><standard_session_servicedirs/><policy context=\"default\"><allow user=\"{}\"/><allow own=\"*\"/><allow send_destination=\"*\"/><allow receive_sender=\"*\"/></policy></busconfig>",nix::unistd::getuid())).map_err(|e| Fault::unavailable(e.to_string()))?;
+        let bus_output = command("dbus-daemon", &runtime, &bus)
             .arg(format!("--config-file={}", bus_config.display()))
             .args(["--fork", "--print-pid=1"])
             .output()
@@ -293,6 +295,13 @@ impl Isolated {
             std::thread::sleep(Duration::from_millis(50));
         };
         let sway_identity = ProcessIdentity::read(sway.id())?;
+        let activation = command("dbus-update-activation-environment", &runtime, &bus)
+            .arg(format!("WAYLAND_DISPLAY={}", wayland.display()))
+            .output()
+            .map_err(|e| Fault::unavailable(format!("设置图形会话服务环境: {e}")))?;
+        if !activation.status.success() {
+            return Err(Fault::unavailable("无法设置独立图形会话的服务环境"));
+        }
         // Create the keyboard before launching GTK/Firefox. Removing the only
         // keyboard between actions makes clients rebind wl_keyboard and can
         // discard the first key while seat capabilities are being negotiated.
@@ -309,20 +318,11 @@ impl Isolated {
         let app_log = fs::File::create(runtime.join("application.log"))
             .map_err(|e| Fault::unavailable(e.to_string()))?;
         let mut cmd = command(application.executable(), &runtime, &bus);
-        let profile_root = state_dir()?.join("profiles").join(&id);
-        for (variable, folder) in [
-            ("XDG_CONFIG_HOME", "config"),
-            ("XDG_DATA_HOME", "data"),
-            ("XDG_STATE_HOME", "state"),
-            ("XDG_CACHE_HOME", "cache"),
-        ] {
-            let path = profile_root.join(folder);
-            fs::create_dir_all(&path).map_err(|e| Fault::unavailable(e.to_string()))?;
-            cmd.env(variable, path);
+        // Keep the user's HOME and XDG data/config/cache/state environment intact.
+        // Only the graphical session and its runtime endpoints are private.
+        if let Some(home) = std::env::var_os("HOME") {
+            cmd.current_dir(home);
         }
-        let home = profile_root.join("home");
-        fs::create_dir_all(&home).map_err(|e| Fault::unavailable(e.to_string()))?;
-        cmd.env("HOME", &home).current_dir(&home);
         if let Application::Installed(app) = &application {
             if let Some(directory) = &app.directory {
                 cmd.current_dir(directory);
@@ -338,12 +338,9 @@ impl Isolated {
             .file_name()
             .is_some_and(|n| n == "firefox" || n == "firefox-esr")
         {
-            let profile = profile_root.join("firefox");
-            fs::create_dir_all(&profile).map_err(|e| Fault::unavailable(e.to_string()))?;
-            fs::write(profile.join("user.js"),"user_pref(\"browser.shell.checkDefaultBrowser\", false);\nuser_pref(\"browser.aboutwelcome.enabled\", false);\nuser_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n").map_err(|e|Fault::unavailable(e.to_string()))?;
-            cmd.args(["--no-remote", "--new-instance", "--profile"])
-                .arg(profile)
-                .arg("about:blank");
+            // Prevent forwarding to the user's other graphical session while using
+            // Firefox's normal profile selection and profile lock unchanged.
+            cmd.args(["--no-remote", "--new-instance", "about:blank"]);
         } else if application
             .executable()
             .file_name()
@@ -363,7 +360,7 @@ impl Isolated {
                 .is_some()
             {
                 return Err(Fault::unavailable(format!(
-                    "应用启动失败；查看 {}",
+                    "应用启动失败；若个人配置被其他实例占用，请先关闭该应用再重试。查看 {}",
                     runtime.join("application.log").display()
                 )));
             }
@@ -378,7 +375,9 @@ impl Isolated {
                 break ProcessIdentity::read(pid as u32)?;
             }
             if Instant::now() > deadline {
-                return Err(Fault::unavailable("应用未创建可验证窗口，启动失败"));
+                return Err(Fault::unavailable(
+                    "应用未创建可验证窗口；若个人配置被其他实例占用，请先关闭该应用再重试",
+                ));
             }
             std::thread::sleep(Duration::from_millis(100));
         };

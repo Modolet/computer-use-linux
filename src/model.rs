@@ -17,7 +17,6 @@ pub enum Scope {
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     Isolated,
-    Existing,
     Desktop,
 }
 
@@ -102,14 +101,6 @@ pub enum Action {
     Text {
         text: String,
     },
-    SetText {
-        node: String,
-        text: String,
-    },
-    Invoke {
-        node: String,
-        action: String,
-    },
     FocusWindow {
         window: String,
     },
@@ -123,8 +114,6 @@ impl Action {
             Self::Scroll { .. } => "scroll",
             Self::Key { .. } => "key",
             Self::Text { .. } => "text",
-            Self::SetText { .. } => "set_text",
-            Self::Invoke { .. } => "invoke",
             Self::FocusWindow { .. } => "focus_window",
         }
     }
@@ -155,9 +144,7 @@ impl Action {
                 }
                 Ok(())
             }
-            Self::Text { text } | Self::SetText { text, .. } if text.len() > 65536 => {
-                Err(Fault::invalid("文本超过 64 KiB"))
-            }
+            Self::Text { text } if text.len() > 65536 => Err(Fault::invalid("文本超过 64 KiB")),
             Self::Key { key, modifiers } if key.len() > 64 || modifiers.len() > 4 => {
                 Err(Fault::invalid("按键参数无效"))
             }

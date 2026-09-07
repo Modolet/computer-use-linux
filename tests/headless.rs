@@ -14,6 +14,28 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+fn test_environment() {
+    assert_eq!(
+        std::env::var("COMPUTER_USE_HEADLESS_TEST").as_deref(),
+        Ok("1")
+    );
+    let runtime = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+    assert!(runtime.starts_with("/tmp"));
+    for (name, directory) in [
+        ("HOME", "home"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_CACHE_HOME", "cache"),
+    ] {
+        assert_eq!(
+            std::path::PathBuf::from(std::env::var_os(name).unwrap()),
+            runtime.join(directory),
+            "请通过 tests/run-headless.sh 使用临时个人数据"
+        );
+    }
+}
+
 struct Cleanup(computer_use_linux::backend::sway::SavedSession);
 fn observe_stable(backend: &mut Isolated, cancel: &Cancellation) -> Observation {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -62,10 +84,7 @@ fn clipboard(backend: &Isolated) -> String {
 #[test]
 #[ignore = "启动两个独立真实应用会话，显式运行隔离集成测试"]
 fn independent_sessions_preserve_input_and_clipboard() {
-    assert_eq!(
-        std::env::var("COMPUTER_USE_HEADLESS_TEST").as_deref(),
-        Ok("1")
-    );
+    test_environment();
     let mut user = Isolated::launch(Application::TextEditor).unwrap();
     let _user = Cleanup(user.saved.clone());
     let mut agent = Isolated::launch(Application::TextEditor).unwrap();
@@ -122,10 +141,7 @@ fn independent_sessions_preserve_input_and_clipboard() {
 #[test]
 #[ignore = "启动独立 Firefox，显式运行隔离集成测试"]
 fn firefox_address_input_and_capture() {
-    assert_eq!(
-        std::env::var("COMPUTER_USE_HEADLESS_TEST").as_deref(),
-        Ok("1")
-    );
+    test_environment();
     let mut browser = Isolated::launch(Application::Firefox).unwrap();
     let _cleanup = Cleanup(browser.saved.clone());
     key(&mut browser, "l");
@@ -157,10 +173,7 @@ impl Drop for Cleanup {
 #[test]
 #[ignore = "启动独立的 Sway 和测试编辑器；需 nix develop 及独立 XDG_RUNTIME_DIR/XDG_STATE_HOME"]
 fn isolated_text_capture_resize_and_cancellation() {
-    assert!(
-        std::env::var("COMPUTER_USE_HEADLESS_TEST").is_ok_and(|v| v == "1"),
-        "必须显式选择隔离集成测试环境"
-    );
+    test_environment();
     let generation = Arc::new(AtomicU64::new(0));
     let cancel = Cancellation::new(generation.clone());
     let mut backend = Isolated::launch(Application::TextEditor).expect("启动测试编辑器");
@@ -281,10 +294,7 @@ fn isolated_text_capture_resize_and_cancellation() {
 #[test]
 #[ignore = "独立 Firefox 中按真实像素验证旋转、缩放与鼠标输入"]
 fn pointer_coordinates_follow_visible_pixels() {
-    assert_eq!(
-        std::env::var("COMPUTER_USE_HEADLESS_TEST").as_deref(),
-        Ok("1")
-    );
+    test_environment();
     let mut browser = Isolated::launch(Application::Firefox).unwrap();
     let _cleanup = Cleanup(browser.saved.clone());
     key(&mut browser, "l");
@@ -418,10 +428,7 @@ fn red_center(o: &Observation) -> Point {
 #[test]
 #[ignore = "长输入期间出现其他进程窗口时必须停止"]
 fn foreign_window_interrupts_inflight_isolated_input() {
-    assert_eq!(
-        std::env::var("COMPUTER_USE_HEADLESS_TEST").as_deref(),
-        Ok("1")
-    );
+    test_environment();
     let mut app = Isolated::launch(Application::TextEditor).unwrap();
     let _cleanup = Cleanup(app.saved.clone());
     key(&mut app, "n");
@@ -501,30 +508,22 @@ fn foreign_window_interrupts_inflight_isolated_input() {
 
 #[test]
 #[ignore = "通过本机 kitty.desktop 验证第三方通用独立实例启动，仅使用私有测试桌面"]
-fn installed_desktop_application_uses_private_home_and_input() {
+fn installed_desktop_application_shares_data_with_private_graphics() {
     use computer_use_linux::backend::applications::DesktopApplication;
-    assert_eq!(
-        std::env::var("COMPUTER_USE_HEADLESS_TEST").as_deref(),
-        Ok("1")
-    );
+    test_environment();
     let entry = std::env::var("COMPUTER_USE_GENERIC_TEST_DESKTOP")
         .expect("设置为本机 kitty.desktop 的绝对路径");
     let app = DesktopApplication::from_file(std::path::Path::new(&entry)).unwrap();
     assert!(app.program.file_name().is_some_and(|s| s == "kitty"));
     let mut isolated = Isolated::launch(Application::Installed(app)).unwrap();
     let _cleanup = Cleanup(isolated.saved.clone());
-    let home = computer_use_linux::backend::sway::state_dir()
-        .unwrap()
-        .join("profiles")
-        .join(&isolated.saved.id)
-        .join("home");
-    assert_ne!(
-        home,
-        std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
-    );
-    // The command is typed only into the fixture's private terminal. Its output
-    // records the inherited environment without reading or writing host files.
-    act(&mut isolated, Action::Text { text: "printf '%s\\n' \"$HOME\" \"$WAYLAND_DISPLAY\" \"$DBUS_SESSION_BUS_ADDRESS\" > isolated-environment.txt".into() });
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    let data_home = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
+    let sentinel = data_home.join("shared-data.txt");
+    std::fs::create_dir_all(&data_home).unwrap();
+    std::fs::write(&sentinel, "personal data").unwrap();
+    // Type only into the fixture's private terminal, with a temporary test HOME.
+    act(&mut isolated, Action::Text { text: r#"printf '%s\n' "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$WAYLAND_DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" > "$HOME/isolated-environment.txt"; cat "$XDG_DATA_HOME/shared-data.txt" >> "$HOME/isolated-environment.txt"; printf ' updated' >> "$XDG_DATA_HOME/shared-data.txt""#.into() });
     act(
         &mut isolated,
         Action::Key {
@@ -534,16 +533,45 @@ fn installed_desktop_application_uses_private_home_and_input() {
     );
     let path = home.join("isolated-environment.txt");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !path.exists() && std::time::Instant::now() < deadline {
+    while std::fs::read_to_string(&sentinel).unwrap() != "personal data updated"
+        && std::time::Instant::now() < deadline
+    {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let data = std::fs::read_to_string(&path).expect("键盘输入必须到达独立终端并执行");
     let lines: Vec<_> = data.lines().collect();
-    assert_eq!(lines[0], home.to_str().unwrap());
-    assert_eq!(lines[1], isolated.saved.wayland.to_str().unwrap());
+    for (index, name) in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_eq!(
+            lines[index],
+            std::env::var(name).unwrap(),
+            "{name} 应与调用者一致"
+        );
+    }
+    assert_eq!(lines[5], isolated.saved.wayland.to_str().unwrap());
     assert_eq!(
-        lines[2],
+        lines[6],
         format!("unix:path={}/bus", isolated.saved.runtime.display())
+    );
+    assert_eq!(lines[7], "personal data", "应用应读到原有数据");
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        "personal data updated",
+        "应用修改必须写回同一份数据"
+    );
+    assert!(
+        !computer_use_linux::backend::sway::state_dir()
+            .unwrap()
+            .join("profiles")
+            .exists()
     );
     assert!(
         isolated
@@ -551,6 +579,31 @@ fn installed_desktop_application_uses_private_home_and_input() {
             .unwrap()
             .png_base64
             .is_some()
+    );
+    // dconf's service must persist to the same configuration even on a private bus.
+    let settings = std::process::Command::new("dconf")
+        .args(["write", "/computer-use-linux-test/shared", "'共享设置'"])
+        .env("XDG_RUNTIME_DIR", &isolated.saved.runtime)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}/bus", isolated.saved.runtime.display()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        settings.status.success(),
+        "{}",
+        String::from_utf8_lossy(&settings.stderr)
+    );
+    let settings = std::process::Command::new("dconf")
+        .args(["read", "/computer-use-linux-test/shared"])
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .output()
+        .unwrap();
+    assert!(settings.status.success());
+    assert_eq!(
+        String::from_utf8(settings.stdout).unwrap().trim(),
+        "'共享设置'"
     );
     let serialized = serde_json::to_vec(&isolated.saved).unwrap();
     let restored: computer_use_linux::backend::sway::SavedSession =

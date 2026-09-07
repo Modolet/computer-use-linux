@@ -395,8 +395,8 @@ mod tests {
             &mut b,
             &Request::RequestSession(SessionRequest {
                 scope: Scope::Application,
-                mode: Mode::Existing,
-                application: None,
+                mode: Mode::Isolated,
+                application: Some("gnome-text-editor".into()),
             }),
         )
         .await

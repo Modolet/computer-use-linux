@@ -51,7 +51,7 @@ impl Mcp {
         }
     }
     #[tool(
-        description = "申请桌面授权。scope=application 配合 isolated/existing；scope=desktop 配合 desktop。isolated 必须用 application 指定已安装应用名称或 .desktop ID（如 firefox、kitty.desktop），用户只需在本地允许或拒绝，不接受启动命令或参数。existing 仍由本地选择已有实例。返回申请编号；授权前不会返回桌面内容。"
+        description = "申请桌面授权。scope=application 配合 isolated；scope=desktop 配合 desktop。isolated 必须用 application 指定已安装应用名称或 .desktop ID（如 firefox、kitty.desktop），用户只需在本地允许或拒绝，不接受启动命令或参数。独立实例只隔离图形会话，沿用个人 HOME、配置和应用数据。返回申请编号；授权前不会返回桌面内容。"
     )]
     async fn request_session(
         &self,
@@ -64,7 +64,7 @@ impl Mcp {
         self.call(Request::SessionStatus(params)).await
     }
     #[tool(
-        description = "观察获准目标，返回 PNG、控件树和新的 observation_id。坐标使用返回图像的像素，不能使用未经观察的目标。"
+        description = "观察获准目标，返回 PNG 和新的 observation_id。坐标使用返回图像的像素，不能使用未经观察的目标。"
     )]
     async fn observe(&self, Parameters(params): Parameters<ObserveRequest>) -> CallToolResult {
         self.call(Request::Observe(params)).await
@@ -85,7 +85,7 @@ impl Mcp {
 impl ServerHandler for Mcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("先申请本地用户授权，再检查状态和能力。已有实例只支持经过验证的后台操作，永不回退到全局输入。单应用授权不等于宿主机文件沙箱。")
+            .with_instructions("先申请本地用户授权，再检查状态和能力。单应用只使用独立图形会话，沿用个人配置和数据，不回退到宿主桌面输入。单应用授权不等于宿主机文件沙箱。")
     }
 }
 

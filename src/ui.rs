@@ -6,10 +6,7 @@
 use crate::{
     backend::{
         Backend, Cancellation,
-        accessibility::{self, Candidate},
         desktop::Desktop,
-        existing::Existing,
-        portal::Portal,
         sway::{Application, Isolated},
     },
     ipc::{self, SharedPolicy},
@@ -38,7 +35,6 @@ struct Prepared {
 enum Event {
     InputQuiescent(u64, Result<()>),
     AllowedIsolated(String, u64, Result<Prepared>),
-    Candidates(Result<Vec<Candidate>>),
     Prepared(String, Result<Prepared>),
     Recovered(Vec<Isolated>),
 }
@@ -48,9 +44,7 @@ struct Ui {
     rows: gtk::Box,
     banner: gtk::Label,
     policy: SharedPolicy,
-    runtime: tokio::runtime::Handle,
     sender: mpsc::Sender<Event>,
-    candidates: RefCell<Vec<Candidate>>,
     prepared: RefCell<HashMap<String, Prepared>>,
     busy: RefCell<HashSet<String>>,
     detached: RefCell<Vec<(String, BackendHandle)>>,
@@ -79,15 +73,12 @@ fn capabilities_text(capabilities: &[String]) -> String {
         .iter()
         .map(|c| match c.as_str() {
             "screenshot" => "截图",
-            "accessibility_tree" => "读取控件",
             "click" => "点击",
             "drag" => "拖动",
             "scroll" => "滚动",
             "key" => "按键",
             "text" => "文本输入",
             "focus_window" => "切换窗口",
-            "set_text" => "编辑控件文本",
-            "invoke" => "控件动作",
             _ => "未知能力",
         })
         .collect::<Vec<_>>()
@@ -110,7 +101,6 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         .application_id("io.github.computer_use_linux.Broker")
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    let rt = runtime.handle().clone();
     app.connect_activate(move |app| {
         let hold = app.hold();
         let window = gtk::ApplicationWindow::builder()
@@ -147,9 +137,7 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
             rows,
             banner,
             policy: policy.clone(),
-            runtime: rt.clone(),
             sender,
-            candidates: RefCell::new(vec![]),
             prepared: RefCell::new(HashMap::new()),
             busy: RefCell::new(HashSet::new()),
             detached: RefCell::new(vec![]),
@@ -160,12 +148,6 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
             if let Some(ui) = weak.upgrade() {
                 ui.policy.lock().unwrap().pause_all();
                 ui.invalidate();
-            }
-        });
-        let weak = Rc::downgrade(&ui);
-        button("刷新应用列表", &controls, move || {
-            if let Some(ui) = weak.upgrade() {
-                ui.load_candidates();
             }
         });
         let weak = Rc::downgrade(&ui);
@@ -186,7 +168,6 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         std::thread::spawn(move || {
             let _ = recover_sender.send(Event::Recovered(Isolated::recover()));
         });
-        ui.load_candidates();
         glib::timeout_add_local(Duration::from_millis(150), move || {
             let _keep_alive = &hold;
             if receiver_show.try_iter().last().is_some() {
@@ -211,17 +192,11 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
                             match result {
                                 Ok(()) => {
                                     ui.window.present();
-                                    ui.load_candidates();
                                 }
                                 Err(e) => tracing::error!("授权界面保持隐藏：{e}"),
                             }
                         }
                     }
-                    Event::Candidates(Ok(list)) => *ui.candidates.borrow_mut() = list,
-                    Event::Candidates(Err(e)) => ui.banner.set_text(&format!(
-                        "已有实例不可用：{}；仍可使用独立实例或整机模式。",
-                        e.message
-                    )),
                     Event::Prepared(id, result) => {
                         ui.busy.borrow_mut().remove(&id);
                         match result {
@@ -298,12 +273,6 @@ impl Ui {
         self.window.set_visible(false);
         self.policy.lock().unwrap().ui_visible = false;
     }
-    fn load_candidates(&self) {
-        let sender = self.sender.clone();
-        std::thread::spawn(move || {
-            let _ = sender.send(Event::Candidates(accessibility::candidates()));
-        });
-    }
     fn render(self: &Rc<Self>) {
         let mut statuses: Vec<_> = self
             .policy
@@ -333,7 +302,6 @@ impl Ui {
                 status.label.as_deref().unwrap_or("新的授权申请"),
                 match status.mode {
                     Mode::Isolated => "独立应用",
-                    Mode::Existing => "已有应用",
                     Mode::Desktop => "整个电脑",
                 },
                 match status.state {
@@ -523,7 +491,7 @@ impl Ui {
                         app.id, app.args
                     )));
                 }
-                row.append(&label("允许 AI 在可见独立窗口中截图、点击、拖动、滚动、按键和输入文本。使用独立配置，不复制个人登录状态；应用保留文件和网络权限。"));
+                row.append(&label("允许 AI 在可见独立窗口中截图、点击、拖动、滚动、按键和输入文本。仅隔离图形会话，使用你的个人配置、登录状态和应用数据，修改会影响日常使用的数据；应用保留文件和网络权限。"));
                 let weak = Rc::downgrade(self);
                 let id = id.to_string();
                 button("允许并启动", row, move || {
@@ -558,63 +526,6 @@ impl Ui {
                             Ok(Prepared {
                                 backend: Box::new(Desktop::connect()?),
                                 label: "整个电脑".into(),
-                                preview: None,
-                            })
-                        });
-                    }
-                });
-            }
-            Mode::Existing => {
-                let choices = self.candidates.borrow().clone();
-                let names: Vec<_> = choices.iter().map(|c| c.label.as_str()).collect();
-                let dropdown = gtk::DropDown::from_strings(&names);
-                row.append(&dropdown);
-                row.append(&label(
-                    "只列出能核实进程与窗口身份的应用。未验证的后台写操作不会开放。",
-                ));
-                let weak = Rc::downgrade(self);
-                let prepare_id = id.to_string();
-                let d = dropdown.clone();
-                let list = choices.clone();
-                button("选择该窗口的截图权限", row, move || {
-                    if let Some(ui) = weak.upgrade()
-                        && let Some(candidate) = list.get(d.selected() as usize).cloned()
-                    {
-                        let sender = ui.sender.clone();
-                        let id = prepare_id.clone();
-                        ui.busy.borrow_mut().insert(id.clone());
-                        ui.invalidate();
-                        ui.runtime.spawn(async move {
-                            let result = match Portal::select().await {
-                                Ok(portal) => tokio::task::spawn_blocking(move || {
-                                    let title = candidate.label.clone();
-                                    let mut b = Existing::bind(candidate, Some(portal))?;
-                                    let preview = b.observe(None, &uncancelled())?.png_base64;
-                                    Ok(Prepared {
-                                        backend: Box::new(b) as Box<dyn Backend>,
-                                        label: title,
-                                        preview,
-                                    })
-                                })
-                                .await
-                                .unwrap_or_else(|e| Err(Fault::unavailable(e.to_string()))),
-                                Err(e) => Err(e),
-                            };
-                            let _ = sender.send(Event::Prepared(id, result));
-                        });
-                    }
-                });
-                let weak = Rc::downgrade(self);
-                let id = id.to_string();
-                button("准备控件权限（不含截图）", row, move || {
-                    if let Some(ui) = weak.upgrade()
-                        && let Some(c) = choices.get(dropdown.selected() as usize).cloned()
-                    {
-                        ui.prepare(id.clone(), move || {
-                            let title = c.label.clone();
-                            Ok(Prepared {
-                                backend: Box::new(Existing::bind(c, None)?),
-                                label: title,
                                 preview: None,
                             })
                         });
@@ -1194,7 +1105,6 @@ mod tests {
         check_single_allow_flow(&app);
     }
     fn check_single_allow_flow(app: &gtk::Application) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
         let policy = Arc::new(Mutex::new(Policy::default()));
         let owner = uuid::Uuid::new_v4();
         let id = {
@@ -1224,9 +1134,7 @@ mod tests {
             rows,
             banner: label(""),
             policy: policy.clone(),
-            runtime: runtime.handle().clone(),
             sender,
-            candidates: RefCell::new(vec![]),
             prepared: RefCell::new(HashMap::new()),
             busy: RefCell::new(HashSet::new()),
             detached: RefCell::new(vec![]),

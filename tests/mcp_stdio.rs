@@ -104,7 +104,7 @@ async fn stdio_tools_and_permission_errors() {
         .into_iter()
         .collect()
     );
-    send(&mut input,serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"request_session","arguments":{"scope":"application","mode":"existing"}}})).await;
+    send(&mut input,serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"request_session","arguments":{"scope":"application","mode":"isolated","application":"gnome-text-editor"}}})).await;
     let result = receive(&mut output).await;
     let status: serde_json::Value =
         serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -123,6 +123,16 @@ async fn stdio_tools_and_permission_errors() {
         serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(status["value"]["state"], "pending");
     assert_eq!(status["value"]["targets"], serde_json::json!([]));
+    // The removed mode must neither be advertised nor reach the permission broker.
+    let request_tool = tools
+        .iter()
+        .find(|t| t["name"] == "request_session")
+        .unwrap();
+    let schema = request_tool["inputSchema"].to_string();
+    assert!(!schema.contains("existing"));
+    send(&mut input, serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"request_session","arguments":{"scope":"application","mode":"existing"}}})).await;
+    let removed = receive(&mut output).await;
+    assert!(removed["error"].is_object() || removed["result"]["isError"] == true);
     input.shutdown().await.unwrap();
     drop(input);
     tokio::time::timeout(Duration::from_secs(3), broker)

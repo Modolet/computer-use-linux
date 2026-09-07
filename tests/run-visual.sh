@@ -4,10 +4,13 @@
 # @author modolet <y@xxyx.io>
 # @date 2026-09-07
 set -euo pipefail
+# Keep build caches outside the temporary application HOME.
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 
 if [[ "${COMPUTER_USE_UI_TEST:-}" != 1 ]]; then
 	test_runtime=$(mktemp -d /tmp/cv-XXXXXX)
-	exec env XDG_RUNTIME_DIR="$test_runtime" \
+	mkdir -p "$test_runtime/home" "$test_runtime/cache"
+	exec env HOME="$test_runtime/home" XDG_CACHE_HOME="$test_runtime/cache" XDG_RUNTIME_DIR="$test_runtime" \
 		XDG_STATE_HOME="$test_runtime/state" XDG_CONFIG_HOME="$test_runtime/config" \
 		XDG_DATA_HOME="$test_runtime/data" COMPUTER_USE_UI_TEST=1 \
 		dbus-run-session -- bash "$0"

@@ -4,15 +4,10 @@
 //! @date 2026-09-07
 
 use crate::model::*;
-pub mod accessibility;
 pub mod applications;
-mod cast_watch;
 pub mod desktop;
-pub mod existing;
-pub mod portal;
 pub mod process;
 pub mod sway;
-mod verified;
 pub mod wayland;
 use std::sync::{
     Arc,

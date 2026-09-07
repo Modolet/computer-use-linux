@@ -68,7 +68,7 @@ impl Policy {
         }
         if !matches!(
             (request.scope, request.mode),
-            (Scope::Application, Mode::Existing | Mode::Isolated) | (Scope::Desktop, Mode::Desktop)
+            (Scope::Application, Mode::Isolated) | (Scope::Desktop, Mode::Desktop)
         ) {
             return Err(Fault::invalid("授权范围和模式不匹配"));
         }
@@ -471,8 +471,8 @@ mod tests {
                 owner,
                 SessionRequest {
                     scope: Scope::Application,
-                    mode: Mode::Existing,
-                    application: None,
+                    mode: Mode::Isolated,
+                    application: Some("gnome-text-editor".into()),
                 },
             )
             .unwrap();

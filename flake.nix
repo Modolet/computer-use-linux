@@ -19,9 +19,6 @@
           glib
           libxkbcommon
           wayland
-          pipewire
-          gst_all_1.gstreamer
-          gst_all_1.gst-plugins-base
         ];
       runtime =
         pkgs: with pkgs; [
@@ -29,9 +26,6 @@
           dbus
           firefox
           gnome-text-editor
-          gst_all_1.gst-plugins-base
-          gst_all_1.gst-plugins-good
-          pipewire
         ];
     in
     {
@@ -65,7 +59,6 @@
             buildInputs = dependencies pkgs;
             preFixup = ''
               gappsWrapperArgs+=(--prefix PATH : "${pkgs.lib.makeBinPath (runtime pkgs)}")
-              gappsWrapperArgs+=(--prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "${pkgs.lib.makeSearchPath "lib/gstreamer-1.0" (runtime pkgs)}")
             '';
             meta.mainProgram = "computer-use-linux";
           };
@@ -91,9 +84,6 @@
               shellcheck
             ];
             buildInputs = dependencies pkgs ++ runtime pkgs;
-            GST_PLUGIN_SYSTEM_PATH_1_0 = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" (runtime pkgs);
-            TEST_ATSPI_LAUNCHER = "${pkgs.at-spi2-core}/libexec/at-spi-bus-launcher";
-            TEST_ATSPI_REGISTRY = "${pkgs.at-spi2-core}/libexec/at-spi2-registryd";
           };
         }
       );
