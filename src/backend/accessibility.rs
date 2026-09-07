@@ -36,7 +36,12 @@ pub struct Candidate {
 pub struct Accessibility {
     connection: Connection,
     pub candidate: Candidate,
-    nodes: HashMap<String, OwnedObjectPath>,
+    nodes: HashMap<String, NodeBinding>,
+}
+struct NodeBinding {
+    path: OwnedObjectPath,
+    text: Option<String>,
+    editable: bool,
 }
 
 pub fn connect_bus() -> Result<Connection> {
@@ -182,9 +187,9 @@ impl Accessibility {
         }
         self.nodes.clear();
         let mut visited = HashSet::new();
-        let mut remaining = 256;
+        let mut remaining = 1024;
         let root = self.candidate.root.clone();
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let deadline = Instant::now() + Duration::from_secs(8);
         Ok(vec![self.walk(
             &root,
             0,
@@ -204,7 +209,7 @@ impl Accessibility {
         cancel: &Cancellation,
     ) -> Result<Node> {
         cancel.check()?;
-        if depth > 12 || *remaining == 0 || Instant::now() > deadline {
+        if depth > 32 || *remaining == 0 || Instant::now() > deadline {
             return Err(Fault::unavailable("控件树读取达到限制"));
         }
         *remaining -= 1;
@@ -215,6 +220,7 @@ impl Accessibility {
         let interfaces: Vec<String> = proxy.call("GetInterfaces", &()).unwrap_or_default();
         let children: Vec<Object> = proxy.call("GetChildren", &()).unwrap_or_default();
         let role_number: u32 = proxy.call("GetRole", &()).unwrap_or_default();
+        let states: Vec<u32> = proxy.call("GetState", &()).unwrap_or_default();
         drop(proxy);
         // ATSPI_ROLE_PASSWORD_TEXT = 40. Never expose password fields.
         let text = if role_number != 40 && interfaces.iter().any(|i| i == "org.a11y.atspi.Text") {
@@ -226,14 +232,26 @@ impl Accessibility {
             None
         };
         let id = Uuid::new_v4().to_string();
-        self.nodes.insert(id.clone(), path.clone());
+        let editable = super::verified::editor(&self.candidate)
+            && super::verified::editable(&role, &interfaces, &states)
+            && text
+                .as_ref()
+                .is_some_and(|text| text.chars().count() < 4096);
+        self.nodes.insert(
+            id.clone(),
+            NodeBinding {
+                path: path.clone(),
+                text: text.clone(),
+                editable,
+            },
+        );
         let mut nodes = vec![];
         for (bus, child) in children {
             if role_number == 40
                 || bus != self.candidate.bus
                 || visited.contains(child.as_str())
                 || *remaining == 0
-                || depth >= 12
+                || depth >= 32
                 || Instant::now() > deadline
             {
                 continue;
@@ -253,7 +271,11 @@ impl Accessibility {
             },
             role,
             text,
-            actions: vec![],
+            actions: if editable {
+                vec!["set_text".into()]
+            } else {
+                vec![]
+            },
             children: nodes,
         })
     }
@@ -266,18 +288,84 @@ impl Accessibility {
             .ok_or_else(|| Fault::unavailable("缺少窗口焦点状态"))?;
         Ok(state & ((1 << 1) | (1 << 12)) != 0)
     }
-    /// Deliberately closed by default. A toolkit interface is not evidence that
-    /// an application action is safe to invoke in the background.
     pub fn mutation_capabilities(&self) -> Vec<String> {
-        vec![]
+        if super::verified::editor(&self.candidate) {
+            vec!["set_text".into()]
+        } else {
+            vec![]
+        }
     }
-    pub fn act(&mut self, _action: &Action, cancel: &Cancellation) -> Result<()> {
+    pub fn act(&mut self, action: &Action, cancel: &Cancellation) -> Result<()> {
         cancel.check()?;
+        if !self.alive() {
+            return Err(Fault::stale("应用或 D-Bus 所有者已经变化"));
+        }
+        let Action::SetText { node, text } = action else {
+            return Err(Fault::unsupported("此控件动作尚未通过后台验证"));
+        };
+        if !super::verified::editor(&self.candidate) {
+            return Err(Fault::unsupported("应用与 GTK 构建不在已验证名单中"));
+        }
+        let binding = self
+            .nodes
+            .get(node)
+            .ok_or_else(|| Fault::stale("控件引用失效，请重新观察"))?;
+        if !binding.editable {
+            return Err(Fault::unsupported("该控件不能在后台编辑"));
+        }
+        let mut parent = binding.path.clone();
+        for depth in 0..=32 {
+            if parent == self.candidate.root {
+                break;
+            }
+            if depth == 32 {
+                return Err(Fault::stale("控件不再属于授权窗口"));
+            }
+            let (bus, next): Object = self
+                .proxy(parent.as_str(), ACCESSIBLE)?
+                .get_property("Parent")
+                .map_err(fault)?;
+            if bus != self.candidate.bus {
+                return Err(Fault::stale("控件归属变化"));
+            }
+            parent = next;
+        }
+        let proxy = self.proxy(binding.path.as_str(), ACCESSIBLE)?;
+        let role: String = proxy.call("GetRoleName", &()).map_err(fault)?;
+        let interfaces: Vec<String> = proxy.call("GetInterfaces", &()).map_err(fault)?;
+        let states: Vec<u32> = proxy.call("GetState", &()).map_err(fault)?;
+        if !super::verified::editable(&role, &interfaces, &states) {
+            return Err(Fault::stale("控件类型或可编辑状态变化"));
+        }
+        drop(proxy);
+        let text_proxy = self.proxy(binding.path.as_str(), "org.a11y.atspi.Text")?;
+        let selections: i32 = text_proxy.call("GetNSelections", &()).map_err(fault)?;
+        if selections != 0 {
+            return Err(Fault::unsupported(
+                "编辑区存在文本选择，为保护主选择剪贴板拒绝修改",
+            ));
+        }
+        let count: i32 = text_proxy.get_property("CharacterCount").map_err(fault)?;
+        if !(0..4096).contains(&count) {
+            return Err(Fault::stale("编辑区内容长度变化，请重新观察"));
+        }
+        let current: String = text_proxy.call("GetText", &(0i32, count)).map_err(fault)?;
+        drop(text_proxy);
+        if binding.text.as_ref() != Some(&current) {
+            return Err(Fault::stale("控件内容已改变，请重新观察"));
+        }
         if self.focused()? {
             return Err(Fault::new(ErrorCode::Paused, "用户正在使用目标窗口"));
         }
-        Err(Fault::unsupported(
-            "此应用及版本尚无通过无干扰验证的后台写操作；可选择独立实例",
-        ))
+        cancel.check()?;
+        let changed: bool = self
+            .proxy(binding.path.as_str(), "org.a11y.atspi.EditableText")?
+            .call("SetTextContents", &(text.as_str(),))
+            .map_err(fault)?;
+        self.nodes.clear();
+        if !changed {
+            return Err(Fault::unsupported("应用拒绝后台文本编辑"));
+        }
+        Ok(())
     }
 }

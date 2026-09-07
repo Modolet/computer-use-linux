@@ -86,9 +86,14 @@
               pkg-config
               nixfmt
               wl-clipboard
+              niri
+              shfmt
+              shellcheck
             ];
             buildInputs = dependencies pkgs ++ runtime pkgs;
             GST_PLUGIN_SYSTEM_PATH_1_0 = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" (runtime pkgs);
+            TEST_ATSPI_LAUNCHER = "${pkgs.at-spi2-core}/libexec/at-spi-bus-launcher";
+            TEST_ATSPI_REGISTRY = "${pkgs.at-spi2-core}/libexec/at-spi2-registryd";
           };
         }
       );

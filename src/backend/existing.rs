@@ -99,6 +99,21 @@ impl Backend for Existing {
         if observation.target.id != self.target.id || !self.alive() {
             return Err(Fault::stale("应用引用失效"));
         }
+        let niri_ipc::Response::Windows(windows) =
+            super::desktop::niri_request(&self.niri, niri_ipc::Request::Windows)?
+        else {
+            return Err(Fault::stale("窗口状态不可用"));
+        };
+        let own: Vec<_> = windows
+            .iter()
+            .filter(|w| w.pid == Some(self.process.pid as i32))
+            .collect();
+        if own.len() != 1 {
+            return Err(Fault::unsupported("应用出现其他窗口或对话框，暂停后台操作"));
+        }
+        if own[0].is_focused {
+            return Err(Fault::new(ErrorCode::Paused, "用户正在使用目标窗口"));
+        }
         self.accessibility.act(action, cancel)
     }
     fn alive(&mut self) -> bool {
