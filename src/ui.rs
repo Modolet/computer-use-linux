@@ -666,7 +666,14 @@ fn preview(
     });
     let pic = picture.clone();
     let state = current.clone();
-    let b = backend.clone();
+    let b = backend
+        .lock()
+        .unwrap()
+        .local_view()
+        .ok()
+        .flatten()
+        .map(|view| Arc::new(Mutex::new(view)))
+        .unwrap_or_else(|| backend.clone());
     let p = policy.clone();
     let id = session_id;
     glib::timeout_add_local(Duration::from_millis(300), move || {
@@ -897,6 +904,33 @@ mod tests {
         policy.lock().unwrap().resume(&id).unwrap();
         pump(Duration::from_secs(2));
         assert!(window.is_visible() && window.is_mapped());
+        let picture = window
+            .child()
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .next_sibling()
+            .unwrap()
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::Picture>()
+            .unwrap();
+        let paintable = picture.paintable().unwrap();
+        let held_backend = backend.clone();
+        let (held, acquired) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _guard = held_backend.lock().unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        acquired.recv().unwrap();
+        pump(Duration::from_secs(1));
+        assert_ne!(
+            picture.paintable().unwrap(),
+            paintable,
+            "输入占用后端时仍应刷新可见画面"
+        );
+        worker.join().unwrap();
         assert_eq!(
             policy.lock().unwrap().status(owner, &id).unwrap().state,
             State::Active

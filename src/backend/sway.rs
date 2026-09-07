@@ -449,6 +449,14 @@ impl Isolated {
 }
 
 impl Backend for Isolated {
+    fn local_view(&self) -> Result<Option<Box<dyn Backend>>> {
+        Ok(Some(Box::new(Self {
+            saved: self.saved.clone(),
+            target_id: self.target_id.clone(),
+            geometry: None,
+            input: Wayland::connect(&self.saved.wayland, &Self::cancel())?,
+        })))
+    }
     fn survives_revoke(&self) -> bool {
         true
     }

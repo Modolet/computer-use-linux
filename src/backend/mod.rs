@@ -53,6 +53,10 @@ pub trait Backend: Send {
     fn preview(&mut self, cancel: &Cancellation) -> Result<Observation> {
         self.observe(None, cancel)
     }
+    /// A separate capture connection keeps the visible view live during input.
+    fn local_view(&self) -> Result<Option<Box<dyn Backend>>> {
+        Ok(None)
+    }
     /// Must validate live geometry and identity before sending the first event.
     fn act(
         &mut self,
