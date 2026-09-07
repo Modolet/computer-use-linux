@@ -172,11 +172,14 @@ async fn connection(socket: UnixStream, policy: SharedPolicy, show: std::sync::m
         };
         let (policy, show, writer) = (policy.clone(), show.clone(), writer.clone());
         tokio::spawn(async move {
-            let _guard = guard;
             let response = dispatch(policy, owner, request, show)
                 .await
                 .unwrap_or_else(Response::Error);
-            let _ = write_frame(&mut *writer.lock().await, &response).await;
+            let mut writer = writer.lock().await;
+            // The client may send its next request as soon as it receives this response.
+            // Keep response ordering while releasing the completed dispatch first.
+            drop(guard);
+            let _ = write_frame(&mut *writer, &response).await;
         });
     }
     // Reader remains independent of a long capture/action, so EOF cancels it immediately.
@@ -361,6 +364,26 @@ mod tests {
         fn alive(&mut self) -> bool {
             true
         }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_requests_do_not_require_client_delays() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let policy = Arc::new(Mutex::new(Policy::default()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(connection(a, policy, tx));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for _ in 0..2000 {
+                write_frame(&mut b, &Request::PauseAll).await.unwrap();
+                let response: Response =
+                    serde_json::from_slice(&read_frame(&mut b, MAX_RESPONSE).await.unwrap())
+                        .unwrap();
+                assert!(matches!(response, Response::Ok));
+            }
+        })
+        .await
+        .expect("连续请求应保持连接且及时响应");
+        b.shutdown().await.unwrap();
+        task.await.unwrap();
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn socket_eof_revokes_an_inflight_capture() {
