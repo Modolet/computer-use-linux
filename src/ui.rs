@@ -657,10 +657,8 @@ fn preview(
             if cancel.check().is_err() {
                 continue;
             }
-            if let Ok(mut b) = human_backend.lock()
-                && let Ok(o) = b.observe(None, &cancel)
-            {
-                let _ = b.act(&o, &action, &cancel);
+            if let Ok(mut b) = human_backend.lock() {
+                let _ = b.human_act(&action, &cancel);
             }
         }
     });
@@ -721,7 +719,7 @@ fn preview(
     let sender = action_sender.clone();
     let generation = manual_generation.clone();
     gesture.connect_pressed(move |gesture, _, x, y| {
-        if !enable.is_active() {
+        if !enable.is_active() || gesture.current_button() == 1 {
             return;
         }
         pic.grab_focus();
@@ -740,6 +738,46 @@ fn preview(
         }
     });
     picture.add_controller(gesture);
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(1);
+    let start = Rc::new(RefCell::new(None::<(f64, f64, Cancellation)>));
+    let begin = start.clone();
+    let enabled = takeover.clone();
+    let pic = picture.clone();
+    let generation = manual_generation.clone();
+    drag.connect_drag_begin(move |_, x, y| {
+        if enabled.is_active() {
+            pic.grab_focus();
+            *begin.borrow_mut() = Some((x, y, Cancellation::new(generation.clone())));
+        }
+    });
+    let enabled = takeover.clone();
+    let state = current.clone();
+    let pic = picture.clone();
+    let sender = action_sender.clone();
+    drag.connect_drag_end(move |_, dx, dy| {
+        let Some((x, y, cancel)) = start.borrow_mut().take() else {
+            return;
+        };
+        if !enabled.is_active() || cancel.check().is_err() {
+            return;
+        }
+        if let Some(o) = state.borrow().as_ref()
+            && let Some(from) = picture_point(&pic, o, x, y)
+            && let Some(to) = picture_point(&pic, o, x + dx, y + dy)
+        {
+            let action = if dx.hypot(dy) < 4.0 {
+                Action::Click {
+                    at: from,
+                    button: Button::Left,
+                }
+            } else {
+                Action::Drag { from, to }
+            };
+            let _ = sender.try_send((action, cancel));
+        }
+    });
+    picture.add_controller(drag);
     let position = Rc::new(Cell::new((0.0, 0.0)));
     let motion = gtk::EventControllerMotion::new();
     let pos = position.clone();

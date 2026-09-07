@@ -58,6 +58,10 @@ pub trait Backend: Send {
     fn local_view(&self) -> Result<Option<Box<dyn Backend>>> {
         Ok(None)
     }
+    /// Only the local GTK takeover window calls this; never exposed over MCP/IPC.
+    fn human_act(&mut self, _: &Action, _: &Cancellation) -> Result<()> {
+        Err(Fault::unsupported("此后端不提供独立应用接管"))
+    }
     /// Must validate live geometry and identity before sending the first event.
     fn act(
         &mut self,

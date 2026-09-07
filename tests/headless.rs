@@ -458,6 +458,32 @@ fn foreign_window_interrupts_inflight_isolated_input() {
             .code,
         ErrorCode::PermissionDenied
     );
+    let c = Cancellation::new(Arc::new(AtomicU64::new(0)));
+    assert!(
+        app.local_view().unwrap().unwrap().observe(None, &c).is_ok(),
+        "本地用户仍可看见独立会话中的窗口"
+    );
+    app.human_act(
+        &Action::Key {
+            key: "n".into(),
+            modifiers: vec![Modifier::Ctrl],
+        },
+        &c,
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    app.human_act(
+        &Action::Text {
+            text: "本地接管".into(),
+        },
+        &c,
+    )
+    .unwrap();
+    assert_eq!(
+        app.observe(None, &c).unwrap_err().code,
+        ErrorCode::PermissionDenied,
+        "本地接管不能提升 AI 权限"
+    );
     computer_use_linux::backend::process::ProcessIdentity::read(other.id())
         .unwrap()
         .terminate();

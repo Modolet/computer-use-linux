@@ -81,6 +81,7 @@ pub struct Isolated {
     target_id: String,
     geometry: Option<(String, u64)>,
     input: Wayland,
+    local_only: bool,
 }
 
 pub fn state_dir() -> Result<PathBuf> {
@@ -367,6 +368,7 @@ impl Isolated {
             target_id: Uuid::new_v4().to_string(),
             geometry: None,
             input,
+            local_only: false,
         };
         result.check_windows()?;
         startup.0.clear();
@@ -396,14 +398,15 @@ impl Isolated {
                     target_id: Uuid::new_v4().to_string(),
                     geometry: None,
                     input,
+                    local_only: false,
                 })
             })
             .collect()
     }
     fn check_windows(&self) -> Result<String> {
-        Self::check_saved_windows(&self.saved)
+        Self::check_saved_windows(&self.saved, self.local_only)
     }
-    fn check_saved_windows(saved: &SavedSession) -> Result<String> {
+    fn check_saved_windows(saved: &SavedSession, local_only: bool) -> Result<String> {
         if !saved.sway.alive() || !saved.app.alive() {
             return Err(Fault::stale("独立应用或合成器已退出"));
         }
@@ -417,7 +420,9 @@ impl Isolated {
         for window in list {
             let pid = window["pid"].as_u64().unwrap() as u32;
             let identity = ProcessIdentity::read(pid)?;
-            if !descendant(pid, saved.app.pid) || identity.executable != saved.app.executable {
+            if !local_only
+                && (!descendant(pid, saved.app.pid) || identity.executable != saved.app.executable)
+            {
                 return Err(Fault::denied(
                     "独立会话出现未授权应用窗口；暂停观察和输入，请在本地接管处理",
                 ));
@@ -473,7 +478,16 @@ impl Backend for Isolated {
             target_id: self.target_id.clone(),
             geometry: None,
             input: Wayland::connect(&self.saved.wayland, &Self::cancel())?,
+            local_only: true,
         })))
+    }
+    fn human_act(&mut self, action: &Action, cancel: &Cancellation) -> Result<()> {
+        let mut local = self
+            .local_view()?
+            .ok_or_else(|| Fault::unavailable("本地视图不可用"))?;
+        let observation = local.observe(None, cancel)?;
+        action.validate(observation.target.width, observation.target.height)?;
+        local.act(&observation, action, cancel)
     }
     fn survives_revoke(&self) -> bool {
         true
@@ -568,12 +582,13 @@ impl Backend for Isolated {
             return Err(Fault::stale("虚拟显示器缩放变化"));
         }
         let saved = self.saved.clone();
+        let local_only = self.local_only;
         self.input.input_checked(
             &output,
             (observation.target.width, observation.target.height),
             action,
             cancel,
-            &mut || Self::check_saved_windows(&saved).map(|_| ()),
+            &mut || Self::check_saved_windows(&saved, local_only).map(|_| ()),
         )?;
         self.geometry = None;
         Ok(())
