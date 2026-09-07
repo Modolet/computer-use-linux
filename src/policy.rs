@@ -25,6 +25,7 @@ pub struct Session {
     pub backend: Option<BackendHandle>,
     pub observation: Option<Observation>,
     pub visible_views: usize,
+    pub requested_application: Option<String>,
 }
 
 #[derive(Default)]
@@ -71,6 +72,22 @@ impl Policy {
         ) {
             return Err(Fault::invalid("授权范围和模式不匹配"));
         }
+        match (request.mode, request.application.as_deref()) {
+            (Mode::Isolated, Some(name))
+                if !name.is_empty()
+                    && name.len() <= 256
+                    && name.trim() == name
+                    && !name
+                        .chars()
+                        .any(|c| c.is_control() || c == '/' || c == '\\') => {}
+            (Mode::Isolated, _) => {
+                return Err(Fault::invalid(
+                    "独立实例必须指定 application：已安装应用的名称或 .desktop ID，不能传命令或路径",
+                ));
+            }
+            (_, Some(_)) => return Err(Fault::invalid("application 参数仅适用于独立实例")),
+            (_, None) => {}
+        }
         if self
             .sessions
             .values()
@@ -106,6 +123,7 @@ impl Policy {
                 backend: None,
                 observation: None,
                 visible_views: 0,
+                requested_application: request.application,
             },
         );
         Ok(status)
@@ -343,7 +361,14 @@ mod tests {
         let owner = Uuid::new_v4();
         p.register(owner);
         let id = p
-            .request(owner, SessionRequest { scope, mode })
+            .request(
+                owner,
+                SessionRequest {
+                    scope,
+                    mode,
+                    application: (mode == Mode::Isolated).then(|| "firefox".into()),
+                },
+            )
             .unwrap()
             .session_id;
         p.grant(&id, "test".into(), Box::new(Fake)).unwrap();
@@ -363,7 +388,8 @@ mod tests {
                 owner,
                 SessionRequest {
                     scope: Scope::Application,
-                    mode: Mode::Isolated
+                    mode: Mode::Isolated,
+                    application: Some("gnome-text-editor".into()),
                 }
             )
             .is_err()
@@ -391,6 +417,51 @@ mod tests {
         p.resume(&id).unwrap();
     }
     #[test]
+    fn isolated_request_requires_an_application_without_command_paths() {
+        let mut p = Policy::default();
+        let owner = Uuid::new_v4();
+        p.register(owner);
+        for application in [
+            None,
+            Some("".into()),
+            Some("/bin/sh".into()),
+            Some("firefox\n".into()),
+        ] {
+            assert!(
+                p.request(
+                    owner,
+                    SessionRequest {
+                        scope: Scope::Application,
+                        mode: Mode::Isolated,
+                        application
+                    }
+                )
+                .is_err()
+            );
+        }
+        let status = p
+            .request(
+                owner,
+                SessionRequest {
+                    scope: Scope::Application,
+                    mode: Mode::Isolated,
+                    application: Some("kitty.desktop".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            p.sessions[&status.session_id]
+                .requested_application
+                .as_deref(),
+            Some("kitty.desktop")
+        );
+        assert!(
+            status.label.is_none() && status.capabilities.is_empty() && status.targets.is_empty()
+        );
+        assert!(p.permit(owner, &status.session_id, None).is_err());
+    }
+
+    #[test]
     fn pending_reveals_no_targets_and_cannot_observe() {
         let mut p = Policy::default();
         let owner = Uuid::new_v4();
@@ -401,6 +472,7 @@ mod tests {
                 SessionRequest {
                     scope: Scope::Application,
                     mode: Mode::Existing,
+                    application: None,
                 },
             )
             .unwrap();
@@ -438,6 +510,7 @@ mod tests {
             SessionRequest {
                 scope: Scope::Desktop,
                 mode: Mode::Desktop,
+                application: None,
             },
         )
         .unwrap();
@@ -456,6 +529,7 @@ mod tests {
                 SessionRequest {
                     scope: Scope::Desktop,
                     mode: Mode::Desktop,
+                    application: None,
                 },
             )
             .unwrap()

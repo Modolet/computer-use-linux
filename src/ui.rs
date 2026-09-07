@@ -37,6 +37,7 @@ struct Prepared {
 }
 enum Event {
     InputQuiescent(u64, Result<()>),
+    AllowedIsolated(String, u64, Result<Prepared>),
     Candidates(Result<Vec<Candidate>>),
     Prepared(String, Result<Prepared>),
     Recovered(Vec<Isolated>),
@@ -241,6 +242,16 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
                                 }
                             }
                             Err(e) => ui.banner.set_text(&e.message),
+                        }
+                    }
+                    Event::AllowedIsolated(id, epoch, result) => {
+                        ui.busy.borrow_mut().remove(&id);
+                        match result {
+                            Ok(ready) => ui.finish_allowed_isolated(&id, epoch, ready),
+                            Err(e) => {
+                                ui.policy.lock().unwrap().deny(&id, e.message.clone());
+                                ui.banner.set_text(&e.message);
+                            }
                         }
                     }
                     Event::Recovered(sessions) => {
@@ -484,27 +495,53 @@ impl Ui {
     fn pending_controls(self: &Rc<Self>, row: &gtk::Box, id: &str, mode: Mode) {
         match mode {
             Mode::Isolated => {
-                let dropdown =
-                    gtk::DropDown::from_strings(&["Firefox（独立配置）", "GNOME Text Editor"]);
-                row.append(&dropdown);
-                row.append(&label("将启动独立实例。个人浏览器的登录状态不会自动复制。"));
+                let requested = self
+                    .policy
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get(id)
+                    .and_then(|s| s.requested_application.clone())
+                    .unwrap_or_default();
+                row.append(&label(&format!("请求启动：{requested}")));
+                let application = match Application::requested(&requested) {
+                    Ok(application) => application,
+                    Err(e) => {
+                        self.policy.lock().unwrap().deny(id, e.message.clone());
+                        row.append(&label(&e.message));
+                        return;
+                    }
+                };
+                row.append(&label(&format!(
+                    "应用：{}\n启动程序：{}",
+                    application.label(),
+                    application.executable().display()
+                )));
+                if let Application::Installed(app) = &application {
+                    row.append(&label(&format!(
+                        "桌面条目：{}\n预设参数：{:?}",
+                        app.id, app.args
+                    )));
+                }
+                row.append(&label("允许 AI 在可见独立窗口中截图、点击、拖动、滚动、按键和输入文本。使用独立配置，不复制个人登录状态；应用保留文件和网络权限。"));
                 let weak = Rc::downgrade(self);
                 let id = id.to_string();
-                button("启动应用并预览", row, move || {
+                button("允许并启动", row, move || {
                     if let Some(ui) = weak.upgrade() {
-                        let app = if dropdown.selected() == 0 {
-                            Application::Firefox
-                        } else {
-                            Application::TextEditor
-                        };
-                        ui.prepare(id.clone(), move || {
-                            let mut b = Isolated::launch(app)?;
-                            let preview = b.observe(None, &uncancelled())?.png_base64;
-                            Ok(Prepared {
-                                backend: Box::new(b),
-                                label: app.label().into(),
-                                preview,
-                            })
+                        ui.busy.borrow_mut().insert(id.clone());
+                        ui.invalidate();
+                        let epoch = ui.policy.lock().unwrap().ui_epoch;
+                        let sender = ui.sender.clone();
+                        let id = id.clone();
+                        let application = application.clone();
+                        std::thread::spawn(move || {
+                            let name = application.label().to_string();
+                            let result = Isolated::launch(application).map(|backend| Prepared {
+                                backend: Box::new(backend),
+                                label: name,
+                                preview: None,
+                            });
+                            let _ = sender.send(Event::AllowedIsolated(id, epoch, result));
                         });
                     }
                 });
@@ -586,6 +623,59 @@ impl Ui {
             }
         }
     }
+    fn finish_allowed_isolated(&self, id: &str, epoch: u64, ready: Prepared) {
+        if !self
+            .policy
+            .lock()
+            .unwrap()
+            .sessions
+            .get(id)
+            .is_some_and(|s| s.status.state == State::Pending)
+        {
+            self.detached
+                .borrow_mut()
+                .push((ready.label, Arc::new(Mutex::new(ready.backend))));
+            return;
+        }
+        if let Err(e) = self
+            .policy
+            .lock()
+            .unwrap()
+            .grant(id, ready.label, ready.backend)
+        {
+            self.banner.set_text(&e.message);
+            return;
+        }
+        let backend = self.policy.lock().unwrap().sessions[id]
+            .backend
+            .clone()
+            .unwrap();
+        preview(
+            &self.app,
+            backend,
+            self.policy.clone(),
+            Some(id.to_string()),
+        );
+        // A newer authorization request must remain visible and pause this session.
+        if self.policy.lock().unwrap().ui_epoch != epoch {
+            return;
+        }
+        self.window.set_visible(false);
+        let policy = self.policy.clone();
+        let window = self.window.clone();
+        let id = id.to_string();
+        glib::timeout_add_local_once(Duration::from_millis(250), move || {
+            let mut p = policy.lock().unwrap();
+            if p.ui_epoch != epoch || window.is_visible() {
+                return;
+            }
+            p.ui_visible = false;
+            if let Err(e) = p.resume(&id) {
+                tracing::warn!("独立应用保持暂停：{e}");
+            }
+        });
+    }
+
     fn prepare(&self, id: String, prepare: impl FnOnce() -> Result<Prepared> + Send + 'static) {
         if !self.busy.borrow_mut().insert(id.clone()) {
             return;
@@ -992,6 +1082,7 @@ mod tests {
                     SessionRequest {
                         scope: Scope::Application,
                         mode: Mode::Isolated,
+                        application: Some("gnome-text-editor".into()),
                     },
                 )
                 .unwrap();
@@ -1100,5 +1191,102 @@ mod tests {
             policy.lock().unwrap().status(owner, &id).unwrap().state,
             State::Paused
         );
+        check_single_allow_flow(&app);
+    }
+    fn check_single_allow_flow(app: &gtk::Application) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let policy = Arc::new(Mutex::new(Policy::default()));
+        let owner = uuid::Uuid::new_v4();
+        let id = {
+            let mut p = policy.lock().unwrap();
+            p.register(owner);
+            p.request(
+                owner,
+                SessionRequest {
+                    scope: Scope::Application,
+                    mode: Mode::Isolated,
+                    application: Some("gnome-text-editor".into()),
+                },
+            )
+            .unwrap()
+            .session_id
+        };
+        let window = gtk::ApplicationWindow::builder()
+            .application(app)
+            .title("授权流程测试")
+            .build();
+        let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        window.set_child(Some(&rows));
+        let (sender, receiver) = mpsc::channel();
+        let ui = Rc::new(Ui {
+            app: app.clone(),
+            window: window.clone(),
+            rows,
+            banner: label(""),
+            policy: policy.clone(),
+            runtime: runtime.handle().clone(),
+            sender,
+            candidates: RefCell::new(vec![]),
+            prepared: RefCell::new(HashMap::new()),
+            busy: RefCell::new(HashSet::new()),
+            detached: RefCell::new(vec![]),
+            signature: RefCell::new(String::new()),
+        });
+        ui.render();
+        window.present();
+        pump(Duration::from_millis(200));
+        fn visit(widget: &gtk::Widget, buttons: &mut Vec<gtk::Button>) {
+            assert!(
+                !widget.is::<gtk::DropDown>(),
+                "独立应用授权不能再要求用户选择应用"
+            );
+            if let Some(b) = widget.downcast_ref::<gtk::Button>() {
+                buttons.push(b.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                visit(&w, buttons);
+                child = w.next_sibling();
+            }
+        }
+        let mut buttons = vec![];
+        visit(ui.rows.upcast_ref(), &mut buttons);
+        assert_eq!(
+            policy.lock().unwrap().status(owner, &id).unwrap().state,
+            State::Pending
+        );
+        assert!(policy.lock().unwrap().sessions[&id].backend.is_none());
+        let allow = buttons
+            .iter()
+            .find(|b| b.label().as_deref() == Some("允许并启动"))
+            .unwrap();
+        // Local GTK action on the explicitly isolated test desktop; no MCP approval API.
+        allow.emit_clicked();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            pump(Duration::from_millis(50));
+            if let Ok(Event::AllowedIsolated(id, epoch, result)) = receiver.try_recv() {
+                ui.finish_allowed_isolated(&id, epoch, result.unwrap());
+                break;
+            }
+            assert!(Instant::now() < deadline, "允许后应启动独立应用");
+        }
+        pump(Duration::from_secs(1));
+        assert_eq!(
+            policy.lock().unwrap().status(owner, &id).unwrap().state,
+            State::Active,
+            "一次允许应启动可见应用并恢复控制，不再要求二次确认"
+        );
+        assert!(!window.is_visible());
+        assert!(app.windows().iter().any(|w| w.is_mapped()));
+        policy.lock().unwrap().close_local(&id);
+        for backend in Isolated::recover() {
+            backend.saved.app.terminate();
+            backend.saved.sway.terminate();
+            backend.saved.bus.terminate();
+        }
+        for window in app.windows() {
+            window.close();
+        }
     }
 }

@@ -15,19 +15,23 @@ use std::sync::{
 };
 
 struct Cleanup(computer_use_linux::backend::sway::SavedSession);
-fn act(backend: &mut Isolated, action: Action) {
-    let c = Cancellation::new(Arc::new(AtomicU64::new(0)));
-    let mut attempts = 0;
-    let o = loop {
-        match backend.observe(None, &c) {
-            Ok(o) => break o,
-            Err(e) if e.code == ErrorCode::StaleTarget && attempts < 10 => {
-                attempts += 1;
+fn observe_stable(backend: &mut Isolated, cancel: &Cancellation) -> Observation {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match backend.observe(None, cancel) {
+            Ok(o) => return o,
+            Err(e) if e.code == ErrorCode::StaleTarget && std::time::Instant::now() < deadline => {
+                // GTK may resize a newly opened document after its first frame.
+                // Follow the real protocol: acquire a fresh observation, never reuse it.
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(e) => panic!("观察失败：{e}"),
         }
-    };
+    }
+}
+fn act(backend: &mut Isolated, action: Action) {
+    let c = Cancellation::new(Arc::new(AtomicU64::new(0)));
+    let o = observe_stable(backend, &c);
     backend.act(&o, &action, &c).unwrap();
 }
 fn key(backend: &mut Isolated, key: &str) {
@@ -161,7 +165,7 @@ fn isolated_text_capture_resize_and_cancellation() {
     let cancel = Cancellation::new(generation.clone());
     let mut backend = Isolated::launch(Application::TextEditor).expect("启动测试编辑器");
     let _cleanup = Cleanup(backend.saved.clone());
-    let observation = backend.observe(None, &cancel).expect("初始截图");
+    let observation = observe_stable(&mut backend, &cancel);
     assert_eq!(
         (observation.target.width, observation.target.height),
         (1280, 800)
@@ -177,7 +181,7 @@ fn isolated_text_capture_resize_and_cancellation() {
         )
         .expect("新建文档快捷键");
     std::thread::sleep(std::time::Duration::from_millis(300));
-    let observation = backend.observe(None, &cancel).expect("新文档截图");
+    let observation = observe_stable(&mut backend, &cancel);
     backend
         .act(
             &observation,
@@ -188,7 +192,7 @@ fn isolated_text_capture_resize_and_cancellation() {
         )
         .expect("中英文输入");
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let after = backend.observe(None, &cancel).expect("输入后截图");
+    let after = observe_stable(&mut backend, &cancel);
     assert_ne!(
         after.png_base64, observation.png_base64,
         "输入应改变真实图像"
@@ -204,7 +208,7 @@ fn isolated_text_capture_resize_and_cancellation() {
         .unwrap();
     }
     for key in ["a", "c"] {
-        let o = backend.observe(None, &cancel).unwrap();
+        let o = observe_stable(&mut backend, &cancel);
         backend
             .act(
                 &o,
@@ -424,7 +428,7 @@ fn foreign_window_interrupts_inflight_isolated_input() {
     let saved = app.saved.clone();
     std::thread::sleep(std::time::Duration::from_millis(300));
     let c = Cancellation::new(Arc::new(AtomicU64::new(0)));
-    let o = app.observe(None, &c).unwrap();
+    let o = observe_stable(&mut app, &c);
     let worker = std::thread::spawn(move || {
         let result = app.act(
             &o,
@@ -493,4 +497,63 @@ fn foreign_window_interrupts_inflight_isolated_input() {
         app.observe(None, &Cancellation::new(Arc::new(AtomicU64::new(0))))
             .is_ok()
     );
+}
+
+#[test]
+#[ignore = "通过本机 kitty.desktop 验证第三方通用独立实例启动，仅使用私有测试桌面"]
+fn installed_desktop_application_uses_private_home_and_input() {
+    use computer_use_linux::backend::applications::DesktopApplication;
+    assert_eq!(
+        std::env::var("COMPUTER_USE_HEADLESS_TEST").as_deref(),
+        Ok("1")
+    );
+    let entry = std::env::var("COMPUTER_USE_GENERIC_TEST_DESKTOP")
+        .expect("设置为本机 kitty.desktop 的绝对路径");
+    let app = DesktopApplication::from_file(std::path::Path::new(&entry)).unwrap();
+    assert!(app.program.file_name().is_some_and(|s| s == "kitty"));
+    let mut isolated = Isolated::launch(Application::Installed(app)).unwrap();
+    let _cleanup = Cleanup(isolated.saved.clone());
+    let home = computer_use_linux::backend::sway::state_dir()
+        .unwrap()
+        .join("profiles")
+        .join(&isolated.saved.id)
+        .join("home");
+    assert_ne!(
+        home,
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+    );
+    // The command is typed only into the fixture's private terminal. Its output
+    // records the inherited environment without reading or writing host files.
+    act(&mut isolated, Action::Text { text: "printf '%s\\n' \"$HOME\" \"$WAYLAND_DISPLAY\" \"$DBUS_SESSION_BUS_ADDRESS\" > isolated-environment.txt".into() });
+    act(
+        &mut isolated,
+        Action::Key {
+            key: "Enter".into(),
+            modifiers: vec![],
+        },
+    );
+    let path = home.join("isolated-environment.txt");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let data = std::fs::read_to_string(&path).expect("键盘输入必须到达独立终端并执行");
+    let lines: Vec<_> = data.lines().collect();
+    assert_eq!(lines[0], home.to_str().unwrap());
+    assert_eq!(lines[1], isolated.saved.wayland.to_str().unwrap());
+    assert_eq!(
+        lines[2],
+        format!("unix:path={}/bus", isolated.saved.runtime.display())
+    );
+    assert!(
+        isolated
+            .observe(None, &Cancellation::new(Arc::new(AtomicU64::new(0))))
+            .unwrap()
+            .png_base64
+            .is_some()
+    );
+    let serialized = serde_json::to_vec(&isolated.saved).unwrap();
+    let restored: computer_use_linux::backend::sway::SavedSession =
+        serde_json::from_slice(&serialized).unwrap();
+    assert!(matches!(restored.application, Application::Installed(_)));
 }

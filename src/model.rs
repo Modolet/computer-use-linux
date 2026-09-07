@@ -26,6 +26,10 @@ pub enum Mode {
 pub struct SessionRequest {
     pub scope: Scope,
     pub mode: Mode,
+    /// Required for isolated mode: installed .desktop ID or unambiguous application name.
+    /// No executable paths, shell commands or launch arguments are accepted.
+    #[serde(default)]
+    pub application: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

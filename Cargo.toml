@@ -9,6 +9,7 @@ ashpd = { version = "0.13.13", default-features = false, features = ["screencast
 base64 = "0.23.1"
 clap = { version = "4.6.6", features = ["derive"] }
 fs2 = "0.4.3"
+gio-unix = "0.22.8"
 gstreamer = "0.25.3"
 gstreamer-allocators = "0.25.3"
 gstreamer-app = "0.25.2"

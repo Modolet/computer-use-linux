@@ -51,7 +51,7 @@ impl Mcp {
         }
     }
     #[tool(
-        description = "申请桌面授权。application 配合 isolated/existing；desktop 配合 desktop。用户必须在本地界面选择实例并授权。返回申请编号；授权前不会返回桌面内容。"
+        description = "申请桌面授权。scope=application 配合 isolated/existing；scope=desktop 配合 desktop。isolated 必须用 application 指定已安装应用名称或 .desktop ID（如 firefox、kitty.desktop），用户只需在本地允许或拒绝，不接受启动命令或参数。existing 仍由本地选择已有实例。返回申请编号；授权前不会返回桌面内容。"
     )]
     async fn request_session(
         &self,

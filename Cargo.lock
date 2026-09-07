@@ -408,6 +408,7 @@ dependencies = [
  "base64",
  "clap",
  "fs2",
+ "gio-unix",
  "gstreamer",
  "gstreamer-allocators",
  "gstreamer-app",
@@ -826,6 +827,31 @@ dependencies = [
  "libc",
  "system-deps 9.0.0",
  "windows-sys",
+]
+
+[[package]]
+name = "gio-unix"
+version = "0.22.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce8d768735e229742c135afa3d3326604088d2df0679901cdb05e791fe2fbe0a"
+dependencies = [
+ "gio",
+ "gio-unix-sys",
+ "glib",
+ "libc",
+]
+
+[[package]]
+name = "gio-unix-sys"
+version = "0.22.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c01dbb58f92f67548d85e2209e073acc7ee04e107c7e04ee69b49e38b4933b4"
+dependencies = [
+ "gio-sys",
+ "glib-sys",
+ "gobject-sys",
+ "libc",
+ "system-deps 9.0.0",
 ]
 
 [[package]]

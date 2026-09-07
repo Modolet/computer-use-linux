@@ -29,7 +29,10 @@ async fn stdio_tools_and_permission_errors() {
             };
             let request: Request = serde_json::from_slice(&bytes).unwrap();
             let response = match request {
-                Request::RequestSession(r) => Response::Status(policy.request(owner, r).unwrap()),
+                Request::RequestSession(r) => match policy.request(owner, r) {
+                    Ok(status) => Response::Status(status),
+                    Err(e) => Response::Error(e),
+                },
                 Request::Observe(r) => {
                     Response::Error(policy.permit(owner, &r.session_id, None).err().unwrap())
                 }
@@ -111,6 +114,15 @@ async fn stdio_tools_and_permission_errors() {
     send(&mut input,serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"observe","arguments":{"session_id":id}}})).await;
     let result = receive(&mut output).await;
     assert_eq!(result["result"]["isError"], true);
+    send(&mut input, serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"request_session","arguments":{"scope":"application","mode":"isolated"}}})).await;
+    assert_eq!(receive(&mut output).await["result"]["isError"], true);
+    send(&mut input, serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"request_session","arguments":{"scope":"application","mode":"isolated","application":"kitty.desktop"}}})).await;
+    let result = receive(&mut output).await;
+    assert_ne!(result["result"]["isError"], true);
+    let status: serde_json::Value =
+        serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(status["value"]["state"], "pending");
+    assert_eq!(status["value"]["targets"], serde_json::json!([]));
     input.shutdown().await.unwrap();
     drop(input);
     tokio::time::timeout(Duration::from_secs(3), broker)

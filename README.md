@@ -6,7 +6,7 @@
 
 | 模式 | 当前能力 | 授权和输入边界 |
 | --- | --- | --- |
-| 单应用：独立实例 | Firefox、GNOME Text Editor 的截图、点击、拖动、滚动、组合键和 Unicode 文本 | 单独图形会话、剪贴板和应用配置；默认显示实时应用窗口 |
+| 单应用：独立实例 | 已安装 Wayland 图形应用的截图、点击、拖动、滚动、组合键和 Unicode 文本 | 申请中指定应用，本地只需允许或拒绝；单独图形会话、HOME、剪贴板和配置，默认显示实时窗口 |
 | 单应用：已有实例 | AT-SPI 控件树；Portal/PipeWire 单窗口截图 | 绑定进程生命周期、D-Bus 唯一所有者和 niri 窗口；经验证的 GNOME Text Editor 构建支持后台多行文本编辑；其他应用或版本保持只读 |
 | 整个电脑 | niri 窗口切换、显示器截图；合成器开放协议时提供虚拟输入 | 使用真实桌面；最多一个整机会话执行输入 |
 
@@ -55,11 +55,15 @@ cargo run -- mcp
 
 ## 使用流程
 
-1. 模型调用 `request_session`，例如 `{"scope":"application","mode":"isolated"}`。立即返回申请编号和 pending 状态，不返回桌面信息。
-2. 在本地面板选择 Firefox 或 GNOME Text Editor，启动并查看预览，然后确认授权。独立应用会自动打开实时窗口。
-3. 点击“隐藏面板并恢复 AI”。授权面板会先暂停所有自动输入，并等待正在执行的输入释放按键后才显示授权按钮；单纯查看应用窗口不会暂停。
+1. 模型调用 `request_session`，例如 `{"scope":"application","mode":"isolated","application":"kitty.desktop"}`。立即返回申请编号和 pending 状态，不返回桌面信息，也不启动应用。
+2. 本地面板显示申请的应用名称、启动程序、桌面条目预设参数和控制能力。用户只需点击“允许并启动”或“拒绝”，不用再选择应用。允许后自动启动独立实例、打开实时窗口并恢复 AI；没有二次授权按钮。
+3. 如果准备期间出现新的授权申请，应用先保持暂停，避免隐藏新的请求。已有实例和整机模式仍在本地确认范围后，通过“隐藏面板并恢复 AI”开始控制。授权面板会先暂停所有自动输入，并等待正在执行的输入释放按键后才显示授权按钮；单纯查看应用窗口不会暂停。
 4. 模型通过 `session_status` 获取状态、能力和目标；调用 `observe` 获取图像、控件树和观察编号；每次 `act` 都必须带上最新的 `session_id`、`observation_id` 和 `target`。
 5. 随时打开 `manage` 暂停或撤销，或执行 `pause-all`。恢复只能通过本地面板完成。
+
+独立实例的 `application` 必填，可使用已安装 `.desktop` ID（推荐，例如 `kitty.desktop`）、不带后缀的 ID，或能唯一匹配的应用名称。服务从当前桌面的 GIO 应用数据库读取启动定义；MCP 不接收可执行路径、启动参数或任意 shell 命令，也不会向模型返回已安装应用列表。名字不明确、没有可执行启动条目时拒绝请求，不要求用户改选应用。Firefox 和 GNOME Text Editor 保留专用启动适配，软件包提供的这两个程序也可直接用 `firefox` 和 `gnome-text-editor` 申请。
+
+通用入口通过桌面条目的 `Exec` 直接启动进程，不调用宿主 D-Bus 激活；文件和 URL 占位符在空启动时移除。应用使用私有 HOME 和 XDG 配置目录。当前要求原生 Wayland 窗口；仅支持 X11、只提供 D-Bus 激活、需要外部终端的条目，或启动器退出后无法核实窗口归属的应用会报不支持/启动失败，不回退到宿主桌面。外部应用窗口仍不自动获得 AI 权限。通用入口不等于每个应用都已经验证兼容。
 
 申请组合：`application/isolated`、`application/existing`、`desktop/desktop`。坐标以观察返回的图像像素为准；返回目标包含像素尺寸、缩放和显示器/应用标签。一次动作消耗一次观察。尺寸、布局或实例变化后必须重新观察。显示器移除、重新连接时，旧显示器引用也会失效。`scroll` 的正 `dy` 向下、正 `dx` 向右；约 15 个滚轮单位对应一个刻度，实际页面滚动距离由应用决定。
 
@@ -99,7 +103,7 @@ binds {
 
 Socket 位于 `$XDG_RUNTIME_DIR/computer-use-linux/broker.sock`，目录 0700、socket 0600，并检查连接 UID。授权与每条客户端连接绑定；断线、撤销、应用退出都会取消当前输入。暂停会使排队动作失效并释放虚拟按键。守护进程重启不恢复 AI 授权。
 
-独立应用状态位于 `$XDG_STATE_HOME/computer-use-linux`，未设置时使用 `~/.local/state/computer-use-linux`。每个实例使用单独配置目录，Firefox 禁止复用个人实例。登录由用户在可见窗口中接管完成；登录状态留在该实例的持久化配置中。当前新建会话会创建新配置，保留实例可在管理面板中重新打开。
+独立应用状态位于 `$XDG_STATE_HOME/computer-use-linux`，未设置时使用 `~/.local/state/computer-use-linux`。每个实例使用单独 HOME 和配置目录，Firefox 禁止复用个人实例。应用仍可通过绝对路径访问用户原有文件；这不是文件系统沙箱。登录由用户在可见窗口中接管完成；登录状态留在该实例的持久化配置中。当前新建会话会创建新配置，保留实例可在管理面板中重新打开。
 
 撤销只停止控制，不强制关闭有未保存内容的独立应用；应用保留供本地接管。已有应用继续运行。独立实例限制桌面观察和输入范围，仍然拥有原来的文件、网络权限和同一 Unix 用户权限，不构成针对恶意应用的文件系统或进程安全沙箱。
 
@@ -127,11 +131,13 @@ cargo test --test headless -- --ignored --test-threads=1
 
 测试覆盖连接隔离、授权前拒绝、暂停与撤销、过期引用、可见视图门控、真实 stdio MCP、Firefox 和编辑器的文本与快捷键、独立会话剪贴板隔离、尺寸变化和取消。
 
-可见窗口验收使用另一套专用测试桌面：`nix develop --command bash tests/run-visual.sh`。验证 GTK 窗口确实映射、实时画面显示期间 AI 可以继续输入，以及关闭窗口后自动暂停。设置 `COMPUTER_USE_UI_PNG` 为绝对路径可保存该测试桌面的截图。
+可见窗口验收使用另一套专用测试桌面：`nix develop --command bash tests/run-visual.sh`。验证 GTK 窗口确实映射、实时画面显示期间 AI 可以继续输入，以及关闭窗口后自动暂停；同时验证独立实例申请没有应用选择器，且一次本地允许即可启动可见窗口并恢复控制。设置 `COMPUTER_USE_UI_PNG` 为绝对路径可保存该测试桌面的截图。
 
 真实 niri 后端验收：`nix develop --command bash tests/run-niri.sh`。测试在私有 Sway 内运行 niri，不向宿主发送输入；覆盖整机按键、点击、拖动、滚动、分数缩放，以及后台八次中文改写与前台持续键鼠、普通剪贴板和主选择剪贴板操作并发执行。还验证用户选区、未验证版本、窗口尺寸变化、关闭重启和取消后的按键释放。
 
 双显示器验收：`nix develop --command bash tests/run-multi-output.sh`。使用真实的两块 Wayland 输出和输入探针，niri IPC 元数据使用测试夹具。验证不同分辨率、1.25 缩放、输入仅送往指定显示器、断开和重连后的引用失效；这不是物理双显示器硬件测试。独立 Firefox 测试逐一重载页面，并验证全部八种旋转和翻转后的像素点击及滚轮响应。
+
+第三方独立应用验收：在上述私有测试环境中设置 `COMPUTER_USE_GENERIC_TEST_DESKTOP` 为本机 `kitty.desktop` 的绝对路径，执行 `cargo test --test headless installed_desktop_application_uses_private_home_and_input -- --ignored --test-threads=1`。测试通过通用桌面条目启动 Kitty，并验证输入到达独立终端、HOME/Wayland/D-Bus 私有化和会话元数据恢复。
 
 Portal 实机验收：`nix develop --command cargo run --example portal-check`。在系统选择器中选择 `computer-use-portal-check.txt` 的具体窗口。该命令不会发送鼠标、键盘或剪贴板输入；窗口选择必须由本地用户完成。niri 的嵌套模式没有录屏所需的 GBM 设备，这项测试需要实际图形会话。采集协商线性 32 位 DMA-BUF，按实际分配大小、步长和偏移读取并转换为 PNG；驱动不支持线性映射或格式协商失败时返回后端错误。
 

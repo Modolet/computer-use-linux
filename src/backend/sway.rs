@@ -22,22 +22,42 @@ use std::{
 };
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Application {
     Firefox,
     TextEditor,
+    Installed(super::applications::DesktopApplication),
 }
 impl Application {
-    pub fn label(self) -> &'static str {
+    pub fn requested(name: &str) -> Result<Self> {
+        match super::applications::DesktopApplication::resolve(name) {
+            Ok(app) => Ok(Self::Installed(app)),
+            Err(_)
+                if name == "firefox" && gtk4::glib::find_program_in_path("firefox").is_some() =>
+            {
+                Ok(Self::Firefox)
+            }
+            Err(_)
+                if name == "gnome-text-editor"
+                    && gtk4::glib::find_program_in_path("gnome-text-editor").is_some() =>
+            {
+                Ok(Self::TextEditor)
+            }
+            Err(e) => Err(e),
+        }
+    }
+    pub fn label(&self) -> &str {
         match self {
             Self::Firefox => "Firefox",
             Self::TextEditor => "GNOME Text Editor",
+            Self::Installed(app) => &app.name,
         }
     }
-    pub fn executable(self) -> &'static str {
+    pub fn executable(&self) -> &Path {
         match self {
-            Self::Firefox => "firefox",
-            Self::TextEditor => "gnome-text-editor",
+            Self::Firefox => Path::new("firefox"),
+            Self::TextEditor => Path::new("gnome-text-editor"),
+            Self::Installed(app) => &app.program,
         }
     }
 }
@@ -99,7 +119,7 @@ pub fn state_dir() -> Result<PathBuf> {
     Ok(root)
 }
 
-fn command(program: &str, runtime: &Path, bus: &str) -> Command {
+fn command(program: impl AsRef<std::ffi::OsStr>, runtime: &Path, bus: &str) -> Command {
     let mut command = Command::new(program);
     for name in [
         "DISPLAY",
@@ -300,18 +320,35 @@ impl Isolated {
             fs::create_dir_all(&path).map_err(|e| Fault::unavailable(e.to_string()))?;
             cmd.env(variable, path);
         }
+        let home = profile_root.join("home");
+        fs::create_dir_all(&home).map_err(|e| Fault::unavailable(e.to_string()))?;
+        cmd.env("HOME", &home).current_dir(&home);
+        if let Application::Installed(app) = &application {
+            if let Some(directory) = &app.directory {
+                cmd.current_dir(directory);
+            }
+            cmd.args(&app.args);
+        }
         cmd.env("WAYLAND_DISPLAY", &wayland)
             .env("MOZ_ENABLE_WAYLAND", "1")
             .stdout(Stdio::null())
             .stderr(app_log);
-        if matches!(application, Application::Firefox) {
+        if application
+            .executable()
+            .file_name()
+            .is_some_and(|n| n == "firefox" || n == "firefox-esr")
+        {
             let profile = profile_root.join("firefox");
             fs::create_dir_all(&profile).map_err(|e| Fault::unavailable(e.to_string()))?;
             fs::write(profile.join("user.js"),"user_pref(\"browser.shell.checkDefaultBrowser\", false);\nuser_pref(\"browser.aboutwelcome.enabled\", false);\nuser_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n").map_err(|e|Fault::unavailable(e.to_string()))?;
             cmd.args(["--no-remote", "--new-instance", "--profile"])
                 .arg(profile)
                 .arg("about:blank");
-        } else {
+        } else if application
+            .executable()
+            .file_name()
+            .is_some_and(|n| n == "gnome-text-editor")
+        {
             cmd.arg("--standalone");
         }
         let mut app = cmd

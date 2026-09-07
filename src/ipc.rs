@@ -373,6 +373,7 @@ mod tests {
             &Request::RequestSession(SessionRequest {
                 scope: Scope::Application,
                 mode: Mode::Existing,
+                application: None,
             }),
         )
         .await
