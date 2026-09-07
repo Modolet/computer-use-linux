@@ -8,7 +8,7 @@ use crate::{
     model::*,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -24,12 +24,16 @@ pub struct Session {
     pub generation: Arc<AtomicU64>,
     pub backend: Option<BackendHandle>,
     pub observation: Option<Observation>,
+    pub visible_views: usize,
 }
 
 #[derive(Default)]
 pub struct Policy {
     pub sessions: HashMap<String, Session>,
     pub ui_visible: bool,
+    pub ui_epoch: u64,
+    pub manual_previews: usize,
+    clients: HashSet<Uuid>,
 }
 
 pub struct Permit {
@@ -39,7 +43,18 @@ pub struct Permit {
 }
 
 impl Policy {
+    pub fn register(&mut self, owner: Uuid) {
+        self.clients.insert(owner);
+    }
+    pub fn open_ui(&mut self) {
+        self.pause_all();
+        self.ui_visible = true;
+        self.ui_epoch = self.ui_epoch.wrapping_add(1);
+    }
     pub fn request(&mut self, owner: Uuid, request: SessionRequest) -> Result<SessionStatus> {
+        if !self.clients.contains(&owner) {
+            return Err(Fault::denied("客户端连接已断开"));
+        }
         if !matches!(
             (request.scope, request.mode),
             (Scope::Application, Mode::Existing | Mode::Isolated) | (Scope::Desktop, Mode::Desktop)
@@ -60,8 +75,7 @@ impl Policy {
                 "每个连接最多八个活动或待处理会话",
             ));
         }
-        self.pause_all();
-        self.ui_visible = true;
+        self.open_ui();
         let id = Uuid::new_v4().to_string();
         let status = SessionStatus {
             session_id: id.clone(),
@@ -81,6 +95,7 @@ impl Policy {
                 generation: Arc::new(AtomicU64::new(0)),
                 backend: None,
                 observation: None,
+                visible_views: 0,
             },
         );
         Ok(status)
@@ -121,14 +136,27 @@ impl Policy {
         }
     }
     pub fn resume(&mut self, id: &str) -> Result<()> {
+        if self
+            .sessions
+            .get(id)
+            .is_some_and(|s| s.status.mode == Mode::Isolated && s.visible_views == 0)
+        {
+            return Err(Fault::new(
+                ErrorCode::Paused,
+                "请先打开应用窗口；不允许隐藏运行",
+            ));
+        }
         let scope = self
             .sessions
             .get(id)
             .ok_or_else(|| Fault::stale("会话不存在"))?
             .status
             .scope;
-        if self.ui_visible {
-            return Err(Fault::new(ErrorCode::Paused, "授权界面仍然打开"));
+        if self.ui_visible || self.manual_previews > 0 {
+            return Err(Fault::new(
+                ErrorCode::Paused,
+                "请先关闭授权界面和手动预览窗口",
+            ));
         }
         if scope == Scope::Desktop {
             for (other, s) in &mut self.sessions {
@@ -154,11 +182,32 @@ impl Policy {
         s.status.state = state;
     }
     pub fn pause(&mut self, id: &str) {
+        if let Some(s) = self.sessions.get_mut(id)
+            && s.status.state == State::Active
+        {
+            Self::stop(s, State::Paused);
+        }
+    }
+    pub fn view_opened(&mut self, id: &str) {
         if let Some(s) = self.sessions.get_mut(id) {
-            if s.status.state == State::Active {
+            s.visible_views += 1;
+        }
+    }
+    pub fn view_closed(&mut self, id: &str) {
+        if let Some(s) = self.sessions.get_mut(id) {
+            s.visible_views = s.visible_views.saturating_sub(1);
+            if s.visible_views == 0 && s.status.state == State::Active {
                 Self::stop(s, State::Paused);
             }
         }
+    }
+    pub fn action_permit(&mut self, owner: Uuid, request: &ActRequest) -> Result<Permit> {
+        let permit = self.permit(owner, &request.session_id, Some(request))?;
+        self.sessions
+            .get_mut(&request.session_id)
+            .unwrap()
+            .observation = None;
+        Ok(permit)
     }
     pub fn pause_all(&mut self) {
         for s in self.sessions.values_mut() {
@@ -179,6 +228,7 @@ impl Policy {
         s.backend.take()
     }
     pub fn disconnect(&mut self, owner: Uuid) -> Vec<BackendHandle> {
+        self.clients.remove(&owner);
         let ids: Vec<_> = self
             .sessions
             .iter()
@@ -194,7 +244,9 @@ impl Policy {
         if !matches!(s.status.state, State::Active | State::Paused) {
             return Err(Fault::denied("尚未获得有效授权"));
         }
-        if action.is_some() && (s.status.state != State::Active || self.ui_visible) {
+        if action.is_some()
+            && (s.status.state != State::Active || self.ui_visible || self.manual_previews > 0)
+        {
             return Err(Fault::new(ErrorCode::Paused, "自动输入已暂停"));
         }
         if let Some(a) = action {
@@ -267,19 +319,52 @@ mod tests {
     fn granted(scope: Scope, mode: Mode) -> (Policy, Uuid, String) {
         let mut p = Policy::default();
         let owner = Uuid::new_v4();
+        p.register(owner);
         let id = p
             .request(owner, SessionRequest { scope, mode })
             .unwrap()
             .session_id;
         p.grant(&id, "test".into(), Box::new(Fake)).unwrap();
+        p.view_opened(&id);
         p.ui_visible = false;
         p.resume(&id).unwrap();
         (p, owner, id)
     }
     #[test]
+    fn disconnected_client_cannot_create_late_request() {
+        let mut p = Policy::default();
+        let owner = Uuid::new_v4();
+        p.register(owner);
+        p.disconnect(owner);
+        assert!(
+            p.request(
+                owner,
+                SessionRequest {
+                    scope: Scope::Application,
+                    mode: Mode::Isolated
+                }
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn visible_application_is_required_but_passive_view_does_not_pause() {
+        let (mut p, owner, id) = granted(Scope::Application, Mode::Isolated);
+        p.view_opened(&id);
+        assert_eq!(p.status(owner, &id).unwrap().state, State::Active);
+        p.view_closed(&id);
+        assert_eq!(p.status(owner, &id).unwrap().state, State::Active);
+        p.view_closed(&id);
+        assert_eq!(p.status(owner, &id).unwrap().state, State::Paused);
+        assert!(p.resume(&id).is_err());
+        p.view_opened(&id);
+        p.resume(&id).unwrap();
+    }
+    #[test]
     fn pending_reveals_no_targets_and_cannot_observe() {
         let mut p = Policy::default();
         let owner = Uuid::new_v4();
+        p.register(owner);
         let s = p
             .request(
                 owner,

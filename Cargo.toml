@@ -5,14 +5,16 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-ashpd = { version = "0.13.13", default-features = false, features = ["tokio"] }
+ashpd = { version = "0.13.13", default-features = false, features = ["screencast", "tokio"] }
 base64 = "0.23.1"
 clap = { version = "4.6.6", features = ["derive"] }
 fs2 = "0.4.3"
 gstreamer = "0.25.3"
 gstreamer-app = "0.25.2"
-gtk4 = "0.11.4"
+gstreamer-video = "0.25.3"
+gtk4 = { version = "0.11.4", features = ["v4_8"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+niri-ipc = "26.4.0"
 nix = { version = "0.31.3", features = ["fs", "socket", "poll", "process", "signal", "user"] }
 rmcp = { version = "3.2.0", features = ["server", "transport-io", "schemars"] }
 schemars = { version = "1.2.2", features = ["uuid1"] }

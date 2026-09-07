@@ -4,6 +4,13 @@
 //! @date 2026-09-07
 
 use crate::model::*;
+pub mod accessibility;
+pub mod desktop;
+pub mod existing;
+pub mod portal;
+pub mod process;
+pub mod sway;
+pub mod wayland;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -35,9 +42,16 @@ impl Cancellation {
 }
 
 pub trait Backend: Send {
+    fn survives_revoke(&self) -> bool {
+        false
+    }
     fn capabilities(&self) -> Vec<String>;
     fn targets(&mut self) -> Result<Vec<Target>>;
     fn observe(&mut self, target: Option<&str>, cancel: &Cancellation) -> Result<Observation>;
+    /// A passive local view must not invalidate the agent's observation.
+    fn preview(&mut self, cancel: &Cancellation) -> Result<Observation> {
+        self.observe(None, cancel)
+    }
     /// Must validate live geometry and identity before sending the first event.
     fn act(
         &mut self,

@@ -2,9 +2,17 @@
 # @brief 可选用户服务与 niri 停止快捷键
 # @author modolet <y@xxyx.io>
 # @date 2026-09-07
-self: { config, lib, pkgs, ... }:
-let cfg = config.services.computer-use-linux;
-in {
+self:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+let
+  cfg = config.services.computer-use-linux;
+in
+{
   options.services.computer-use-linux = {
     enable = lib.mkEnableOption "Linux Computer Use MCP";
     package = lib.mkOption {

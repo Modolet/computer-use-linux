@@ -1,0 +1,732 @@
+//! @file ui.rs
+//! @brief 本地 GTK 授权窗口、会话管理与独立应用预览
+//! @author modolet <y@xxyx.io>
+//! @date 2026-09-07
+
+use crate::{
+    backend::{
+        Backend, Cancellation,
+        accessibility::{self, Candidate},
+        desktop::Desktop,
+        existing::Existing,
+        portal::Portal,
+        sway::{Application, Isolated},
+    },
+    ipc::{self, SharedPolicy},
+    model::*,
+    policy::{BackendHandle, Policy},
+};
+use base64::Engine;
+use gtk4::{self as gtk, gdk, glib, prelude::*};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
+
+struct Prepared {
+    backend: Box<dyn Backend>,
+    label: String,
+    preview: Option<String>,
+}
+enum Event {
+    Candidates(Result<Vec<Candidate>>),
+    Prepared(String, Result<Prepared>),
+    Recovered(Vec<Isolated>),
+}
+struct Ui {
+    app: gtk::Application,
+    window: gtk::ApplicationWindow,
+    rows: gtk::Box,
+    banner: gtk::Label,
+    policy: SharedPolicy,
+    runtime: tokio::runtime::Handle,
+    sender: mpsc::Sender<Event>,
+    candidates: RefCell<Vec<Candidate>>,
+    prepared: RefCell<HashMap<String, Prepared>>,
+    busy: RefCell<HashSet<String>>,
+    detached: RefCell<Vec<(String, BackendHandle)>>,
+    signature: RefCell<String>,
+}
+fn label(text: &str) -> gtk::Label {
+    let l = gtk::Label::new(Some(text));
+    l.set_wrap(true);
+    l.set_xalign(0.0);
+    l
+}
+fn button(text: &str, container: &gtk::Box, action: impl Fn() + 'static) {
+    let b = gtk::Button::with_label(text);
+    b.connect_clicked(move |_| action());
+    container.append(&b);
+}
+fn texture(png: &str) -> Option<gdk::Texture> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(png).ok()?;
+    gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+}
+fn uncancelled() -> Cancellation {
+    Cancellation::new(Arc::new(AtomicU64::new(0)))
+}
+
+pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    let _enter = runtime.enter();
+    let listener = ipc::Listener::bind()?;
+    let policy = Arc::new(Mutex::new(Policy::default()));
+    let (show_tx, show_rx) = mpsc::channel();
+    let show_rx = Rc::new(RefCell::new(Some(show_rx)));
+    let serve_policy = policy.clone();
+    runtime.spawn(async move {
+        if let Err(e) = ipc::serve(listener, serve_policy, show_tx).await {
+            tracing::error!("权限服务退出: {e:#}");
+        }
+    });
+    let app = gtk::Application::builder()
+        .application_id("io.github.computer_use_linux.Broker")
+        .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    let rt = runtime.handle().clone();
+    app.connect_activate(move |app| {
+        let hold = app.hold();
+        let window = gtk::ApplicationWindow::builder()
+            .application(app)
+            .title("Computer Use · 本地授权")
+            .default_width(720)
+            .default_height(720)
+            .build();
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        outer.set_margin_top(18);
+        outer.set_margin_bottom(18);
+        outer.set_margin_start(18);
+        outer.set_margin_end(18);
+        outer.append(&label("应用与电脑控制权限"));
+        outer.append(&label(
+            "此面板打开时，所有 AI 输入均已暂停。应用模式保留应用原有的文件与网络权限。",
+        ));
+        let banner = label("");
+        outer.append(&banner);
+        let rows = gtk::Box::new(gtk::Orientation::Vertical, 14);
+        outer.append(
+            &gtk::ScrolledWindow::builder()
+                .vexpand(true)
+                .child(&rows)
+                .build(),
+        );
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        outer.append(&controls);
+        window.set_child(Some(&outer));
+        let (sender, receiver) = mpsc::channel();
+        let ui = Rc::new(Ui {
+            app: app.clone(),
+            window: window.clone(),
+            rows,
+            banner,
+            policy: policy.clone(),
+            runtime: rt.clone(),
+            sender,
+            candidates: RefCell::new(vec![]),
+            prepared: RefCell::new(HashMap::new()),
+            busy: RefCell::new(HashSet::new()),
+            detached: RefCell::new(vec![]),
+            signature: RefCell::new(String::new()),
+        });
+        let weak = Rc::downgrade(&ui);
+        button("暂停全部", &controls, move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.policy.lock().unwrap().pause_all();
+                ui.invalidate();
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        button("刷新应用列表", &controls, move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.load_candidates();
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        button("隐藏面板（保持暂停）", &controls, move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.hide();
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        window.connect_close_request(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.hide();
+            }
+            glib::Propagation::Stop
+        });
+        let receiver_show = show_rx.borrow_mut().take().unwrap();
+        let recover_sender = ui.sender.clone();
+        std::thread::spawn(move || {
+            let _ = recover_sender.send(Event::Recovered(Isolated::recover()));
+        });
+        ui.load_candidates();
+        glib::timeout_add_local(Duration::from_millis(150), move || {
+            let _keep_alive = &hold;
+            if receiver_show.try_iter().last().is_some() {
+                ui.window.present();
+                ui.load_candidates();
+                ui.invalidate();
+            }
+            for event in receiver.try_iter() {
+                match event {
+                    Event::Candidates(Ok(list)) => *ui.candidates.borrow_mut() = list,
+                    Event::Candidates(Err(e)) => ui.banner.set_text(&format!(
+                        "已有实例不可用：{}；仍可使用独立实例或整机模式。",
+                        e.message
+                    )),
+                    Event::Prepared(id, result) => {
+                        ui.busy.borrow_mut().remove(&id);
+                        match result {
+                            Ok(ready) => {
+                                let pending = ui
+                                    .policy
+                                    .lock()
+                                    .unwrap()
+                                    .sessions
+                                    .get(&id)
+                                    .is_some_and(|s| s.status.state == State::Pending);
+                                if pending {
+                                    ui.prepared.borrow_mut().insert(id, ready);
+                                } else if ready.backend.survives_revoke() {
+                                    ui.detached
+                                        .borrow_mut()
+                                        .push((ready.label, Arc::new(Mutex::new(ready.backend))));
+                                }
+                            }
+                            Err(e) => ui.banner.set_text(&e.message),
+                        }
+                    }
+                    Event::Recovered(sessions) => {
+                        for isolated in sessions {
+                            ui.detached.borrow_mut().push((
+                                format!("恢复：{}", isolated.saved.application.label()),
+                                Arc::new(Mutex::new(Box::new(isolated))),
+                            ));
+                        }
+                    }
+                }
+                ui.invalidate();
+            }
+            ui.render();
+            glib::ControlFlow::Continue
+        });
+    });
+    app.run_with_args::<&str>(&[]);
+    Ok(())
+}
+
+impl Ui {
+    fn invalidate(&self) {
+        self.signature.borrow_mut().clear();
+    }
+    fn hide(&self) {
+        self.window.set_visible(false);
+        self.policy.lock().unwrap().ui_visible = false;
+    }
+    fn load_candidates(&self) {
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(Event::Candidates(accessibility::candidates()));
+        });
+    }
+    fn render(self: &Rc<Self>) {
+        let mut statuses: Vec<_> = self
+            .policy
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .map(|s| s.status.clone())
+            .collect();
+        statuses.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        let signature = serde_json::to_string(&statuses).unwrap();
+        if *self.signature.borrow() == signature {
+            return;
+        }
+        *self.signature.borrow_mut() = signature;
+        while let Some(child) = self.rows.first_child() {
+            self.rows.remove(&child);
+        }
+        if statuses.is_empty() {
+            self.rows
+                .append(&label("等待 MCP 客户端请求。没有活动授权。"));
+        }
+        for status in statuses {
+            let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            row.append(&label(&format!(
+                "{} · {} · {:?}",
+                status.label.as_deref().unwrap_or("新的授权申请"),
+                match status.mode {
+                    Mode::Isolated => "独立应用",
+                    Mode::Existing => "已有应用",
+                    Mode::Desktop => "整个电脑",
+                },
+                status.state
+            )));
+            row.append(&label(&format!("会话 {}", status.session_id)));
+            if let Some(message) = &status.message {
+                row.append(&label(message));
+            }
+            let id = status.session_id.clone();
+            if status.state == State::Pending {
+                if self.busy.borrow().contains(&id) {
+                    row.append(&label("正在准备，请稍候……"));
+                } else if let Some(prepared) = self.prepared.borrow().get(&id) {
+                    row.append(&label(&format!("将授权：{}", prepared.label)));
+                    row.append(&label(&format!(
+                        "能力：{}",
+                        prepared.backend.capabilities().join("、")
+                    )));
+                    if let Some(png) = &prepared.preview
+                        && let Some(t) = texture(png)
+                    {
+                        let p = gtk::Picture::for_paintable(&t);
+                        p.set_height_request(220);
+                        p.set_can_shrink(true);
+                        row.append(&p);
+                    }
+                    let weak = Rc::downgrade(self);
+                    let grant_id = id.clone();
+                    button("确认授权", &row, move || {
+                        if let Some(ui) = weak.upgrade() {
+                            if let Some(ready) = ui.prepared.borrow_mut().remove(&grant_id)
+                                && let Err(e) = ui.policy.lock().unwrap().grant(
+                                    &grant_id,
+                                    ready.label,
+                                    ready.backend,
+                                )
+                            {
+                                ui.banner.set_text(&e.message);
+                            }
+                            let backend = {
+                                let p = ui.policy.lock().unwrap();
+                                p.sessions
+                                    .get(&grant_id)
+                                    .filter(|s| s.status.mode == Mode::Isolated)
+                                    .and_then(|s| s.backend.clone())
+                            };
+                            if let Some(backend) = backend {
+                                preview(
+                                    &ui.app,
+                                    backend,
+                                    ui.policy.clone(),
+                                    Some(grant_id.clone()),
+                                );
+                            }
+                            ui.invalidate();
+                        }
+                    });
+                } else {
+                    self.pending_controls(&row, &id, status.mode);
+                }
+                let weak = Rc::downgrade(self);
+                let deny_id = id.clone();
+                button("拒绝", &row, move || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.policy
+                            .lock()
+                            .unwrap()
+                            .deny(&deny_id, "用户拒绝授权".into());
+                        if let Some(ready) = ui
+                            .prepared
+                            .borrow_mut()
+                            .remove(&deny_id)
+                            .filter(|r| r.backend.survives_revoke())
+                        {
+                            ui.detached
+                                .borrow_mut()
+                                .push((ready.label, Arc::new(Mutex::new(ready.backend))));
+                        }
+                        ui.invalidate();
+                    }
+                });
+            } else if matches!(status.state, State::Active | State::Paused) {
+                row.append(&label(&format!(
+                    "已开放：{}",
+                    status.capabilities.join("、")
+                )));
+                let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                row.append(&controls);
+                let weak = Rc::downgrade(self);
+                let resume_id = id.clone();
+                button("隐藏面板并恢复 AI", &controls, move || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.window.set_visible(false);
+                        let policy = ui.policy.clone();
+                        let id = resume_id.clone();
+                        let epoch = policy.lock().unwrap().ui_epoch;
+                        let window = ui.window.clone();
+                        glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                            let mut p = policy.lock().unwrap();
+                            if p.ui_epoch != epoch || window.is_visible() {
+                                return;
+                            }
+                            p.ui_visible = false;
+                            if let Err(e) = p.resume(&id) {
+                                tracing::warn!("无法恢复：{e}");
+                            }
+                        });
+                    }
+                });
+                let weak = Rc::downgrade(self);
+                let close_id = id.clone();
+                button("撤销", &controls, move || {
+                    if let Some(ui) = weak.upgrade() {
+                        if let Some(handle) = ui.policy.lock().unwrap().close_local(&close_id) {
+                            if status.mode == Mode::Isolated {
+                                ui.detached
+                                    .borrow_mut()
+                                    .push(("已撤销的独立应用".into(), handle));
+                            } else {
+                                ipc::detach(handle);
+                            }
+                        }
+                        ui.invalidate();
+                    }
+                });
+                if status.mode == Mode::Isolated {
+                    let weak = Rc::downgrade(self);
+                    let preview_id = id.clone();
+                    button("打开应用窗口 / 接管", &controls, move || {
+                        if let Some(ui) = weak.upgrade() {
+                            let backend = {
+                                let p = ui.policy.lock().unwrap();
+
+                                p.sessions.get(&preview_id).and_then(|s| s.backend.clone())
+                            };
+                            if let Some(b) = backend {
+                                preview(&ui.app, b, ui.policy.clone(), Some(preview_id.clone()));
+                            }
+                        }
+                    });
+                }
+            }
+            self.rows.append(&row);
+            self.rows
+                .append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        }
+        for (name, backend) in self.detached.borrow().iter() {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.append(&label(name));
+            let app = self.app.clone();
+            let b = backend.clone();
+            let policy = self.policy.clone();
+            button("手动接管（无 AI 授权）", &row, move || {
+                preview(&app, b.clone(), policy.clone(), None)
+            });
+            self.rows.append(&row);
+        }
+    }
+    fn pending_controls(self: &Rc<Self>, row: &gtk::Box, id: &str, mode: Mode) {
+        match mode {
+            Mode::Isolated => {
+                let dropdown =
+                    gtk::DropDown::from_strings(&["Firefox（独立配置）", "GNOME Text Editor"]);
+                row.append(&dropdown);
+                row.append(&label("将启动独立实例。个人浏览器的登录状态不会自动复制。"));
+                let weak = Rc::downgrade(self);
+                let id = id.to_string();
+                button("启动应用并预览", row, move || {
+                    if let Some(ui) = weak.upgrade() {
+                        let app = if dropdown.selected() == 0 {
+                            Application::Firefox
+                        } else {
+                            Application::TextEditor
+                        };
+                        ui.prepare(id.clone(), move || {
+                            let mut b = Isolated::launch(app)?;
+                            let preview = b.observe(None, &uncancelled())?.png_base64;
+                            Ok(Prepared {
+                                backend: Box::new(b),
+                                label: app.label().into(),
+                                preview,
+                            })
+                        });
+                    }
+                });
+            }
+            Mode::Desktop => {
+                row.append(&label(
+                    "将允许 AI 观察整个桌面、切换窗口和使用真实鼠标键盘。可随时暂停。",
+                ));
+                let weak = Rc::downgrade(self);
+                let id = id.to_string();
+                button("检查整机控制能力", row, move || {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.prepare(id.clone(), || {
+                            Ok(Prepared {
+                                backend: Box::new(Desktop::connect()?),
+                                label: "整个电脑".into(),
+                                preview: None,
+                            })
+                        });
+                    }
+                });
+            }
+            Mode::Existing => {
+                let choices = self.candidates.borrow().clone();
+                let names: Vec<_> = choices.iter().map(|c| c.label.as_str()).collect();
+                let dropdown = gtk::DropDown::from_strings(&names);
+                row.append(&dropdown);
+                row.append(&label(
+                    "只列出能核实进程与窗口身份的应用。未验证的后台写操作不会开放。",
+                ));
+                let weak = Rc::downgrade(self);
+                let prepare_id = id.to_string();
+                let d = dropdown.clone();
+                let list = choices.clone();
+                button("选择该窗口的截图权限", row, move || {
+                    if let Some(ui) = weak.upgrade()
+                        && let Some(candidate) = list.get(d.selected() as usize).cloned()
+                    {
+                        let sender = ui.sender.clone();
+                        let id = prepare_id.clone();
+                        ui.busy.borrow_mut().insert(id.clone());
+                        ui.invalidate();
+                        ui.runtime.spawn(async move {
+                            let result = match Portal::select().await {
+                                Ok(portal) => tokio::task::spawn_blocking(move || {
+                                    let title = candidate.label.clone();
+                                    let mut b = Existing::bind(candidate, Some(portal))?;
+                                    let preview = b.observe(None, &uncancelled())?.png_base64;
+                                    Ok(Prepared {
+                                        backend: Box::new(b) as Box<dyn Backend>,
+                                        label: title,
+                                        preview,
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(Fault::unavailable(e.to_string()))),
+                                Err(e) => Err(e),
+                            };
+                            let _ = sender.send(Event::Prepared(id, result));
+                        });
+                    }
+                });
+                let weak = Rc::downgrade(self);
+                let id = id.to_string();
+                button("仅授权控件树读取", row, move || {
+                    if let Some(ui) = weak.upgrade()
+                        && let Some(c) = choices.get(dropdown.selected() as usize).cloned()
+                    {
+                        ui.prepare(id.clone(), move || {
+                            let title = c.label.clone();
+                            Ok(Prepared {
+                                backend: Box::new(Existing::bind(c, None)?),
+                                label: title,
+                                preview: None,
+                            })
+                        });
+                    }
+                });
+            }
+        }
+    }
+    fn prepare(&self, id: String, prepare: impl FnOnce() -> Result<Prepared> + Send + 'static) {
+        if !self.busy.borrow_mut().insert(id.clone()) {
+            return;
+        }
+        self.invalidate();
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(Event::Prepared(id, prepare()));
+        });
+    }
+}
+
+fn preview(
+    app: &gtk::Application,
+    backend: BackendHandle,
+    policy: SharedPolicy,
+    session_id: Option<String>,
+) {
+    if let Some(id) = &session_id {
+        policy.lock().unwrap().view_opened(id);
+    }
+    let window = gtk::ApplicationWindow::builder()
+        .application(app)
+        .title("独立应用 · 实时画面")
+        .default_width(1000)
+        .default_height(720)
+        .build();
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let takeover = gtk::CheckButton::with_label("手动接管（暂停 AI）");
+    outer.append(&takeover);
+    let status = label("正在显示应用；只查看画面不会暂停 AI。");
+    outer.append(&status);
+    let picture = gtk::Picture::new();
+    picture.set_vexpand(true);
+    picture.set_can_shrink(true);
+    picture.set_focusable(true);
+    outer.append(&picture);
+    window.set_child(Some(&outer));
+    let current = Rc::new(RefCell::new(None::<Observation>));
+    let (sender, receiver) = mpsc::channel::<Result<Observation>>();
+    let busy = Arc::new(AtomicBool::new(false));
+    let alive = Rc::new(Cell::new(true));
+    let manual_generation = Arc::new(AtomicU64::new(0));
+    let manual_active = Rc::new(Cell::new(false));
+    let active = manual_active.clone();
+    let p = policy.clone();
+    let gen_toggle = manual_generation.clone();
+    takeover.connect_toggled(move |toggle| {
+        let mut policy = p.lock().unwrap();
+        if toggle.is_active() && !active.replace(true) {
+            policy.pause_all();
+            policy.manual_previews += 1;
+        } else if !toggle.is_active() && active.replace(false) {
+            policy.manual_previews = policy.manual_previews.saturating_sub(1);
+            gen_toggle.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let a = alive.clone();
+    let close_policy = policy.clone();
+    let id = session_id.clone();
+    let generation = manual_generation.clone();
+    window.connect_close_request(move |_| {
+        a.set(false);
+        generation.fetch_add(1, Ordering::SeqCst);
+        let mut p = close_policy.lock().unwrap();
+        if manual_active.get() {
+            p.manual_previews = p.manual_previews.saturating_sub(1);
+        }
+        if let Some(id) = &id {
+            p.view_closed(id);
+        }
+        glib::Propagation::Proceed
+    });
+    let (action_sender, action_receiver) = mpsc::sync_channel::<(Action, Cancellation)>(128);
+    let human_backend = backend.clone();
+    std::thread::spawn(move || {
+        while let Ok((action, cancel)) = action_receiver.recv() {
+            if cancel.check().is_err() {
+                continue;
+            }
+            if let Ok(mut b) = human_backend.lock()
+                && let Ok(o) = b.observe(None, &cancel)
+            {
+                let _ = b.act(&o, &action, &cancel);
+            }
+        }
+    });
+    let pic = picture.clone();
+    let state = current.clone();
+    let b = backend.clone();
+    let p = policy.clone();
+    let id = session_id;
+    glib::timeout_add_local(Duration::from_millis(300), move || {
+        if !alive.get() {
+            return glib::ControlFlow::Break;
+        }
+        for result in receiver.try_iter() {
+            match result {
+                Ok(o) => {
+                    if let Some(t) = o.png_base64.as_deref().and_then(texture) {
+                        pic.set_paintable(Some(&t));
+                    }
+                    *state.borrow_mut() = Some(o);
+                }
+                Err(e) => status.set_text(&e.message),
+            }
+        }
+        if let Some(id) = &id
+            && let Some(session) = p.lock().unwrap().sessions.get(id)
+        {
+            status.set_text(match session.status.state {
+                State::Active => "AI 正在控制此应用 · 你可以继续使用其他窗口",
+                State::Paused => "AI 已暂停 · 可手动接管，或在权限面板恢复",
+                _ => "AI 授权已结束 · 应用保留供你使用",
+            });
+        }
+        if !busy.swap(true, Ordering::SeqCst) {
+            let sender = sender.clone();
+            let backend = b.clone();
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                if let Ok(mut b) = backend.try_lock() {
+                    let _ = sender.send(b.preview(&uncancelled()));
+                }
+                busy.store(false, Ordering::SeqCst);
+            });
+        }
+        glib::ControlFlow::Continue
+    });
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(0);
+    let pic = picture.clone();
+    let state = current.clone();
+    let enable = takeover.clone();
+    let sender = action_sender.clone();
+    let generation = manual_generation.clone();
+    gesture.connect_pressed(move |gesture, _, x, y| {
+        if !enable.is_active() {
+            return;
+        }
+        pic.grab_focus();
+        if let Some(o) = state.borrow().as_ref()
+            && let Some(at) = picture_point(&pic, o, x, y)
+        {
+            let button = match gesture.current_button() {
+                2 => Button::Middle,
+                3 => Button::Right,
+                _ => Button::Left,
+            };
+            let _ = sender.try_send((
+                Action::Click { at, button },
+                Cancellation::new(generation.clone()),
+            ));
+        }
+    });
+    picture.add_controller(gesture);
+    let key = gtk::EventControllerKey::new();
+    let enable = takeover.clone();
+    let generation = manual_generation.clone();
+    key.connect_key_pressed(move |_, key, _, state| {
+        if !enable.is_active() {
+            return glib::Propagation::Proceed;
+        }
+        let mut modifiers = vec![];
+        for (flag, m) in [
+            (gdk::ModifierType::CONTROL_MASK, Modifier::Ctrl),
+            (gdk::ModifierType::ALT_MASK, Modifier::Alt),
+            (gdk::ModifierType::SHIFT_MASK, Modifier::Shift),
+            (gdk::ModifierType::SUPER_MASK, Modifier::Super),
+        ] {
+            if state.contains(flag) {
+                modifiers.push(m);
+            }
+        }
+        let name = key
+            .to_unicode()
+            .filter(|c| !c.is_control())
+            .map(|c| c.to_string())
+            .or_else(|| key.name().map(|s| s.to_string()));
+        if let Some(key) = name {
+            let _ = action_sender.try_send((
+                Action::Key { key, modifiers },
+                Cancellation::new(generation.clone()),
+            ));
+        }
+        glib::Propagation::Stop
+    });
+    picture.add_controller(key);
+    window.present();
+}
+fn picture_point(picture: &gtk::Picture, o: &Observation, x: f64, y: f64) -> Option<Point> {
+    let w = f64::from(o.target.width);
+    let h = f64::from(o.target.height);
+    let scale = (f64::from(picture.width()) / w).min(f64::from(picture.height()) / h);
+    let left = (f64::from(picture.width()) - w * scale) / 2.0;
+    let top = (f64::from(picture.height()) - h * scale) / 2.0;
+    let p = Point {
+        x: (x - left) / scale,
+        y: (y - top) / scale,
+    };
+    (scale > 0.0 && p.x >= 0.0 && p.y >= 0.0 && p.x < w && p.y < h).then_some(p)
+}
