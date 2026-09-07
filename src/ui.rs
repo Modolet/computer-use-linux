@@ -36,6 +36,7 @@ struct Prepared {
     preview: Option<String>,
 }
 enum Event {
+    InputQuiescent(u64, Result<()>),
     Candidates(Result<Vec<Candidate>>),
     Prepared(String, Result<Prepared>),
     Recovered(Vec<Isolated>),
@@ -188,12 +189,33 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         glib::timeout_add_local(Duration::from_millis(150), move || {
             let _keep_alive = &hold;
             if receiver_show.try_iter().last().is_some() {
-                ui.window.present();
-                ui.load_candidates();
-                ui.invalidate();
+                let (epoch, handles) = {
+                    let p = ui.policy.lock().unwrap();
+                    (p.ui_epoch, p.input_handles())
+                };
+                let sender = ui.sender.clone();
+                std::thread::spawn(move || {
+                    let result = wait_for_input(handles);
+                    let _ = sender.send(Event::InputQuiescent(epoch, result));
+                });
             }
             for event in receiver.try_iter() {
                 match event {
+                    Event::InputQuiescent(epoch, result) => {
+                        let ready = {
+                            let p = ui.policy.lock().unwrap();
+                            p.ui_visible && p.ui_epoch == epoch
+                        };
+                        if ready {
+                            match result {
+                                Ok(()) => {
+                                    ui.window.present();
+                                    ui.load_candidates();
+                                }
+                                Err(e) => tracing::error!("授权界面保持隐藏：{e}"),
+                            }
+                        }
+                    }
                     Event::Candidates(Ok(list)) => *ui.candidates.borrow_mut() = list,
                     Event::Candidates(Err(e)) => ui.banner.set_text(&format!(
                         "已有实例不可用：{}；仍可使用独立实例或整机模式。",
@@ -242,6 +264,18 @@ pub fn run(runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         });
     });
     app.run_with_args::<&str>(&[]);
+    Ok(())
+}
+
+// Cancellation is signalled before this runs. Every input worker retains its
+// backend mutex through key release and the Wayland sync, so the authorization
+// buttons must not be mapped until all of those critical sections have exited.
+fn wait_for_input(handles: Vec<BackendHandle>) -> Result<()> {
+    for handle in handles {
+        let _guard = handle
+            .lock()
+            .map_err(|_| Fault::unavailable("输入后端异常，无法确认按键已释放"))?;
+    }
     Ok(())
 }
 
@@ -535,7 +569,7 @@ impl Ui {
                 });
                 let weak = Rc::downgrade(self);
                 let id = id.to_string();
-                button("仅授权控件树读取", row, move || {
+                button("准备控件权限（不含截图）", row, move || {
                     if let Some(ui) = weak.upgrade()
                         && let Some(c) = choices.get(dropdown.selected() as usize).cloned()
                     {
@@ -870,6 +904,43 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn authorization_waits_for_input_cleanup() {
+        struct PendingInput;
+        impl Backend for PendingInput {
+            fn capabilities(&self) -> Vec<String> {
+                vec![]
+            }
+            fn targets(&mut self) -> Result<Vec<Target>> {
+                Ok(vec![])
+            }
+            fn observe(&mut self, _: Option<&str>, _: &Cancellation) -> Result<Observation> {
+                unreachable!()
+            }
+            fn act(&mut self, _: &Observation, _: &Action, _: &Cancellation) -> Result<()> {
+                unreachable!()
+            }
+            fn alive(&mut self) -> bool {
+                true
+            }
+        }
+        let handle: BackendHandle = Arc::new(Mutex::new(Box::new(PendingInput)));
+        let input_cleanup = handle.lock().unwrap();
+        let handles = vec![handle.clone()];
+        let (ready, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || ready.send(wait_for_input(handles)).unwrap());
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(50)).is_err(),
+            "输入释放完成之前，授权按钮必须保持隐藏"
+        );
+        drop(input_cleanup);
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
     }
 
     #[test]

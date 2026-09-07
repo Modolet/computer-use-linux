@@ -10,7 +10,7 @@ use crate::{
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -35,6 +35,7 @@ pub struct Policy {
     pub manual_previews: usize,
     pub retained: Vec<(String, BackendHandle)>,
     clients: HashSet<Uuid>,
+    input_backends: Vec<Weak<Mutex<Box<dyn Backend>>>>,
 }
 
 pub struct Permit {
@@ -46,6 +47,14 @@ pub struct Permit {
 impl Policy {
     pub fn register(&mut self, owner: Uuid) {
         self.clients.insert(owner);
+    }
+    /// Includes a disconnected desktop while its last input worker is cleaning up.
+    /// Weak references preserve no application or control authority themselves.
+    pub fn input_handles(&self) -> Vec<BackendHandle> {
+        self.input_backends
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
     }
     pub fn open_ui(&mut self) {
         self.pause_all();
@@ -127,7 +136,10 @@ impl Policy {
         session.status.targets = targets;
         session.status.state = State::Paused;
         session.status.message = Some("已授权；关闭授权窗口后可在本地恢复".into());
-        session.backend = Some(Arc::new(Mutex::new(backend)));
+        let handle = Arc::new(Mutex::new(backend));
+        self.input_backends.retain(|b| b.strong_count() > 0);
+        self.input_backends.push(Arc::downgrade(&handle));
+        session.backend = Some(handle);
         Ok(())
     }
     pub fn deny(&mut self, id: &str, message: String) {
@@ -406,6 +418,16 @@ mod tests {
         p.disconnect(owner);
         assert!(permit.cancel.check().is_err());
         assert!(p.permit(owner, &id, None).is_err());
+    }
+    #[test]
+    fn disconnected_input_is_included_in_authorization_barrier() {
+        let (mut p, owner, id) = granted(Scope::Desktop, Mode::Desktop);
+        let permit = p.permit(owner, &id, None).unwrap();
+        drop(p.disconnect(owner));
+        assert!(permit.cancel.check().is_err());
+        assert_eq!(p.input_handles().len(), 1);
+        drop(permit);
+        assert!(p.input_handles().is_empty());
     }
     #[test]
     fn opening_approval_cancels_inflight_and_never_auto_resumes() {
