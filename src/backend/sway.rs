@@ -8,6 +8,7 @@ use super::{
     preview::{self, Viewport},
     process::{ProcessIdentity, descendant},
     wayland::Wayland,
+    x11,
 };
 use crate::model::*;
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,10 @@ pub struct SavedSession {
     pub wayland: PathBuf,
     #[serde(default = "legacy_renderer")]
     pub renderer: String,
+    #[serde(default)]
+    pub x11: Option<x11::Endpoint>,
+    #[serde(default)]
+    pub x11_application: bool,
 }
 
 fn legacy_renderer() -> String {
@@ -130,6 +135,8 @@ fn command(program: impl AsRef<std::ffi::OsStr>, runtime: &Path, bus: &str) -> C
     let mut command = Command::new(program);
     for name in [
         "DISPLAY",
+        "XAUTHORITY",
+        "SESSION_MANAGER",
         "WAYLAND_DISPLAY",
         "WAYLAND_SOCKET",
         "NIRI_SOCKET",
@@ -153,7 +160,7 @@ fn command(program: impl AsRef<std::ffi::OsStr>, runtime: &Path, bus: &str) -> C
         .env("XDG_SESSION_TYPE", "wayland")
         .env("GTK_USE_PORTAL", "0")
         .env("GDK_BACKEND", "wayland")
-        .env("QT_QPA_PLATFORM", "wayland")
+        .env("QT_QPA_PLATFORM", "wayland;xcb")
         .env("NO_AT_BRIDGE", "1")
         .stdin(Stdio::null())
         .process_group(0);
@@ -195,8 +202,9 @@ pub fn sway_request(socket: &Path, kind: u32, payload: &str) -> Result<Value> {
 }
 
 fn windows<'a>(node: &'a Value, out: &mut Vec<&'a Value>) {
-    if node.get("pid").and_then(Value::as_u64).is_some()
-        && node.get("app_id").is_some_and(|id| !id.is_null())
+    if node.get("window").and_then(Value::as_u64).is_some()
+        || (node.get("pid").and_then(Value::as_u64).is_some()
+            && node.get("app_id").is_some_and(|id| !id.is_null()))
     {
         out.push(node);
     }
@@ -241,12 +249,19 @@ impl Isolated {
         let bus_identity = ProcessIdentity::read(bus_pid)?;
         let mut startup = StartupGuard(vec![bus_identity.clone()]);
         let config = runtime.join("sway.config");
-        fs::write(&config, "output HEADLESS-1 mode 1280x800\nseat seat0 fallback true\nfocus_on_window_activation none\nfocus_follows_mouse no\nfont monospace 10\nxwayland disable\ndefault_border none\n").map_err(|e| Fault::unavailable(e.to_string()))?;
+        let contents = format!(
+            "output HEADLESS-1 mode 1280x800\nseat seat0 fallback true\nfocus_on_window_activation none\nfocus_follows_mouse no\nfont monospace 10\nxwayland force\ndefault_border none\n{}",
+            x11::REPORT_DISPLAY
+        );
+        fs::write(&config, contents).map_err(|e| Fault::unavailable(e.to_string()))?;
         let (mut sway, wayland, socket, renderer) = start_compositor(&runtime, &bus, &config)?;
         startup.0.push(ProcessIdentity::read(sway.id())?);
         let sway_identity = ProcessIdentity::read(sway.id())?;
+        let x11 = x11::Endpoint::discover(&runtime, &sway_identity)?;
+        x11.windows(&[])?;
         let activation = command("dbus-update-activation-environment", &runtime, &bus)
             .arg(format!("WAYLAND_DISPLAY={}", wayland.display()))
+            .arg(format!("DISPLAY={}", x11.display))
             .output()
             .map_err(|e| Fault::unavailable(format!("设置图形会话服务环境: {e}")))?;
         if !activation.status.success() {
@@ -280,8 +295,13 @@ impl Isolated {
             cmd.args(&app.args);
         }
         cmd.env("WAYLAND_DISPLAY", &wayland)
+            .env("DISPLAY", &x11.display)
             .env("MOZ_ENABLE_WAYLAND", "1")
-            .stdout(Stdio::null())
+            .stdout(
+                app_log
+                    .try_clone()
+                    .map_err(|e| Fault::unavailable(e.to_string()))?,
+            )
             .stderr(app_log);
         if application
             .executable()
@@ -303,26 +323,36 @@ impl Isolated {
             .map_err(|e| Fault::unavailable(format!("启动应用: {e}")))?;
         startup.0.push(ProcessIdentity::read(app.id())?);
         let deadline = Instant::now() + Duration::from_secs(20);
-        let identity = loop {
-            if app
+        let (identity, x11_application) = loop {
+            if let Some(status) = app
                 .try_wait()
                 .map_err(|e| Fault::unavailable(e.to_string()))?
-                .is_some()
             {
                 return Err(Fault::unavailable(format!(
-                    "应用启动失败；若个人配置被其他实例占用，请先关闭该应用再重试。查看 {}",
+                    "应用启动器已退出（{status}），未创建可验证窗口；可能不兼容当前图形会话或配置被占用。查看 {}；日志为空时，启动器可能屏蔽了子进程输出",
                     runtime.join("application.log").display()
                 )));
             }
             let tree = sway_request(&socket, 4, "")?;
             let mut list = vec![];
             windows(&tree, &mut list);
-            if let Some(pid) = list
+            let managed: Vec<_> = list
                 .iter()
-                .filter_map(|w| w["pid"].as_u64())
-                .find(|pid| descendant(*pid as u32, app.id()))
-            {
-                break ProcessIdentity::read(pid as u32)?;
+                .filter_map(|node| node["window"].as_u64().map(|id| id as u32))
+                .collect();
+            if let Ok(xwindows) = x11.windows(&managed) {
+                let found = list.iter().find_map(|node| {
+                    let is_x11 = node["window"].as_u64().is_some();
+                    let pid = if let Some(id) = node["window"].as_u64() {
+                        xwindows.get(&(id as u32))?.process.pid
+                    } else {
+                        node["pid"].as_u64()? as u32
+                    };
+                    descendant(pid, app.id()).then_some((pid, is_x11))
+                });
+                if let Some((pid, is_x11)) = found {
+                    break (ProcessIdentity::read(pid)?, is_x11);
+                }
             }
             if Instant::now() > deadline {
                 return Err(Fault::unavailable(
@@ -338,6 +368,8 @@ impl Isolated {
             id: id.clone(),
             application,
             renderer,
+            x11: Some(x11),
+            x11_application,
             runtime,
             sway: sway_identity,
             app: identity,
@@ -403,17 +435,52 @@ impl Isolated {
         if list.is_empty() {
             return Err(Fault::stale("应用没有窗口"));
         }
-        let mut signature = vec![];
-        for window in list {
-            let pid = window["pid"].as_u64().unwrap() as u32;
-            let identity = ProcessIdentity::read(pid)?;
+        let managed: Vec<_> = list
+            .iter()
+            .filter_map(|node| node["window"].as_u64().map(|id| id as u32))
+            .collect();
+        let xwindows = match &saved.x11 {
+            Some(endpoint) => endpoint.windows(&managed)?,
+            None if managed.is_empty() => Default::default(),
+            None => return Err(Fault::denied("此旧会话没有获准的 X11 端点")),
+        };
+        let authorized = |identity: &ProcessIdentity| -> Result<()> {
             if !local_only
-                && (!descendant(pid, saved.app.pid) || identity.executable != saved.app.executable)
+                && (!descendant(identity.pid, saved.app.pid)
+                    || identity.executable != saved.app.executable)
             {
                 return Err(Fault::denied(
                     "独立会话出现未授权应用窗口；暂停观察和输入，请在本地接管处理",
                 ));
             }
+            Ok(())
+        };
+        // X11 override-redirect menus never enter the Sway managed tree. Their
+        // real XRes client identities must pass the same authorization check.
+        for window in xwindows.values() {
+            // The private compositor owns an off-screen XWM selection window.
+            // Only its exact kernel-backed process lifetime is trusted here.
+            if window.process != saved.sway {
+                authorized(&window.process)?;
+            }
+        }
+        let mut signature = vec![];
+        for window in list {
+            let identity = if let Some(xid) = window["window"].as_u64() {
+                xwindows
+                    .get(&(xid as u32))
+                    .ok_or_else(|| Fault::stale("X11 窗口已关闭"))?
+                    .process
+                    .clone()
+            } else {
+                ProcessIdentity::read(
+                    window["pid"]
+                        .as_u64()
+                        .ok_or_else(|| Fault::denied("窗口没有可验证身份"))?
+                        as u32,
+                )?
+            };
+            authorized(&identity)?;
             signature.push(serde_json::json!([
                 window["id"],
                 window["rect"],
@@ -421,6 +488,7 @@ impl Isolated {
                 identity
             ]));
         }
+        signature.push(serde_json::to_value(&xwindows).unwrap());
         let outputs = sway_request(&saved.socket, 3, "")?;
         let outputs: Vec<_> = outputs
             .as_array()
@@ -696,7 +764,13 @@ impl preview::Source for IsolatedPreview {
             0,
             &format!(
                 "output HEADLESS-1 mode {}x{}@60Hz scale {:.3}",
-                viewport.width, viewport.height, viewport.scale
+                viewport.width,
+                viewport.height,
+                if self.saved.x11_application {
+                    1.0
+                } else {
+                    viewport.scale
+                }
             ),
         )?;
         if !response.as_array().is_some_and(|items| {
@@ -868,7 +942,10 @@ fn start_compositor(
         for entry in fs::read_dir(runtime).ok().into_iter().flatten().flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("wayland-") || name.starts_with("sway-ipc.") {
+            if name.starts_with("wayland-")
+                || name.starts_with("sway-ipc.")
+                || name == "x11-display"
+            {
                 let _ = fs::remove_file(entry.path());
             }
         }

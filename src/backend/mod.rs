@@ -11,6 +11,7 @@ pub mod preview;
 pub mod process;
 pub mod sway;
 pub mod wayland;
+pub mod x11;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},

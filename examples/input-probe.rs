@@ -11,8 +11,12 @@ fn main() {
         runtime.starts_with("/tmp/cn-")
             || runtime.starts_with("/tmp/cp-")
             || runtime.starts_with("/tmp/cm-")
+            || runtime.starts_with("/tmp/cx-")
     );
-    let path = std::path::PathBuf::from(std::env::args().nth(1).unwrap());
+    let path = std::env::args()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(&runtime).join("input.jsonl"));
     assert!(path.starts_with(&runtime));
     let file = Rc::new(RefCell::new(std::fs::File::create(path).unwrap()));
     let log = move |value: serde_json::Value| {

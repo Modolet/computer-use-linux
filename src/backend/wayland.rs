@@ -689,6 +689,20 @@ impl InputGuard {
             Action::Scroll { at, dx, dy } => {
                 self.motion(*at, size);
                 sync()?;
+                // X11 clients such as GTK use the first valuator event as a
+                // baseline. Prime it without displacement so the first actual
+                // wheel step is preserved; never duplicate nonzero scrolling.
+                self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
+                if *dy != 0.0 {
+                    self.pointer
+                        .axis(event_time(), wl_pointer::Axis::VerticalScroll, 0.0);
+                }
+                if *dx != 0.0 {
+                    self.pointer
+                        .axis(event_time(), wl_pointer::Axis::HorizontalScroll, 0.0);
+                }
+                self.pointer.frame();
+                sync()?;
                 cancel.check()?;
                 self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
                 if *dy != 0.0 {
