@@ -3,15 +3,24 @@
 //! @author modolet <y@xxyx.io>
 //! @date 2026-09-07
 
-use super::Cancellation;
+use super::{
+    Cancellation,
+    frame::{PixelFormat, Pixels, RawFrame},
+};
 use crate::model::*;
+#[path = "dmabuf.rs"]
+mod dmabuf;
 use base64::Engine;
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom, Write},
     os::{fd::AsFd, unix::net::UnixStream},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use wayland_client::{
@@ -21,6 +30,7 @@ use wayland_client::{
         wl_shm_pool,
     },
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1 as linux_dma;
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1 as keyboard_manager, zwp_virtual_keyboard_v1 as keyboard,
 };
@@ -72,8 +82,15 @@ struct WireState {
     synced: bool,
     dimensions: Option<(wl_shm::Format, u32, u32, u32)>,
     frame_ready: bool,
+    formats_done: bool,
+    capture_id: u64,
     frame_failed: bool,
     inverted: bool,
+    dma: Option<linux_dma::ZwpLinuxDmabufV1>,
+    dma_formats: Vec<(u32, u64)>,
+    dma_dimensions: Option<(u32, u32, u32)>,
+    dma_import: Option<std::result::Result<wl_buffer::WlBuffer, ()>>,
+    import_id: u64,
 }
 
 pub struct Wayland {
@@ -81,10 +98,37 @@ pub struct Wayland {
     queue: EventQueue<WireState>,
     state: WireState,
     input_output: Option<u32>,
+    capture_buffers: Vec<CaptureBuffer>,
+    dma_pool: Option<dmabuf::Pool>,
     input_devices: Option<(
         pointer::ZwlrVirtualPointerV1,
         keyboard::ZwpVirtualKeyboardV1,
     )>,
+}
+
+struct CaptureRequest(frame::ZwlrScreencopyFrameV1);
+impl Drop for CaptureRequest {
+    fn drop(&mut self) {
+        self.0.destroy();
+    }
+}
+struct CaptureBuffer {
+    key: (wl_shm::Format, u32, u32, u32),
+    buffer: wl_buffer::WlBuffer,
+    pool: wl_shm_pool::WlShmPool,
+    mapping: Arc<memmap2::Mmap>,
+    released: Arc<AtomicBool>,
+}
+impl CaptureBuffer {
+    fn available(&self) -> bool {
+        self.released.load(Ordering::Acquire) && Arc::strong_count(&self.mapping) == 1
+    }
+}
+impl Drop for CaptureBuffer {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        self.pool.destroy();
+    }
 }
 
 impl Wayland {
@@ -115,6 +159,8 @@ impl Wayland {
             state: WireState::default(),
             input_devices: None,
             input_output: None,
+            capture_buffers: vec![],
+            dma_pool: None,
         };
         this.sync(cancel)?;
         this.sync(cancel)?;
@@ -231,29 +277,74 @@ impl Wayland {
         output: &Output,
         cancel: &Cancellation,
     ) -> Result<(String, u32, u32)> {
+        let raw = self.capture_raw(output, false, cancel)?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        raw.rgba()
+            .write_to(&mut png, image::ImageFormat::Png)
+            .map_err(|e| Fault::unavailable(e.to_string()))?;
+        Ok((
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+            raw.width,
+            raw.height,
+        ))
+    }
+
+    fn begin_capture(
+        &mut self,
+        output: &Output,
+        damage: bool,
+        cancel: &Cancellation,
+    ) -> Result<CaptureRequest> {
         let manager = self
             .state
             .copy
             .as_ref()
             .ok_or_else(|| Fault::unsupported("缺少 wlr-screencopy"))?;
-        let shm = self
-            .state
-            .shm
-            .clone()
-            .ok_or_else(|| Fault::unsupported("缺少 wl_shm"))?;
         self.state.dimensions = None;
+        self.state.dma_dimensions = None;
         self.state.frame_failed = false;
         self.state.frame_ready = false;
+        self.state.formats_done = false;
         self.state.inverted = false;
-        let frame = manager.capture_output(0, &output.proxy, &self.queue.handle(), ());
+        self.state.capture_id = self.state.capture_id.wrapping_add(1);
+        let frame = CaptureRequest(manager.capture_output(
+            i32::from(damage),
+            &output.proxy,
+            &self.queue.handle(),
+            self.state.capture_id,
+        ));
         let deadline = Instant::now() + Duration::from_secs(4);
-        while self.state.dimensions.is_none() && !self.state.frame_failed {
+        while (self.state.dimensions.is_none()
+            || (frame.0.version() >= 3 && !self.state.formats_done))
+            && !self.state.frame_failed
+        {
             self.step(cancel, deadline)?;
         }
         if self.state.frame_failed {
             return Err(Fault::unavailable("截图被合成器拒绝"));
         }
-        let (format, width, height, stride) = self.state.dimensions.unwrap();
+        Ok(frame)
+    }
+
+    /// A bounded pool leases immutable pixels to GTK. No PNG, base64, file read,
+    /// or channel swizzle is performed on the normal little-endian preview path.
+    pub fn capture_raw(
+        &mut self,
+        output: &Output,
+        damage: bool,
+        cancel: &Cancellation,
+    ) -> Result<RawFrame> {
+        if !damage {
+            self.capture_buffers.clear();
+        }
+        let frame = self.begin_capture(output, damage, cancel)?;
+        let shm = self
+            .state
+            .shm
+            .clone()
+            .ok_or_else(|| Fault::unsupported("缺少 wl_shm"))?;
+        let key = self.state.dimensions.unwrap();
+        let (format, width, height, stride) = key;
         let size = u64::from(stride) * u64::from(height);
         if width == 0
             || height == 0
@@ -262,49 +353,109 @@ impl Wayland {
             || stride < width.saturating_mul(4)
             || size > 256 * 1024 * 1024
         {
-            frame.destroy();
             return Err(Fault::unavailable("截图尺寸超出限制"));
         }
-        let mut file = tempfile::tempfile().map_err(|e| Fault::unavailable(e.to_string()))?;
-        file.set_len(size)
-            .map_err(|e| Fault::unavailable(e.to_string()))?;
-        let pool = shm.create_pool(file.as_fd(), size as i32, &self.queue.handle(), ());
-        let buffer = pool.create_buffer(
-            0,
-            width as i32,
-            height as i32,
-            stride as i32,
-            format,
-            &self.queue.handle(),
-            (),
-        );
-        frame.copy(&buffer);
-        while !self.state.frame_ready && !self.state.frame_failed {
+        // Obsolete pools can be destroyed while outstanding GTK leases retain
+        // their mappings. Never overwrite a buffer still sampled by GTK.
+        self.capture_buffers.retain(|buffer| buffer.key == key);
+        let slot = self
+            .capture_buffers
+            .iter()
+            .position(CaptureBuffer::available);
+        let slot = match slot {
+            Some(slot) => slot,
+            None if self.capture_buffers.len() < 4 => {
+                let file = tempfile::tempfile().map_err(|e| Fault::unavailable(e.to_string()))?;
+                file.set_len(size)
+                    .map_err(|e| Fault::unavailable(e.to_string()))?;
+                // SAFETY: the private compositor is the only writer. We expose
+                // immutable slices only after screencopy ready and buffer release;
+                // a new write is forbidden while any external Arc lease exists.
+                let mapping = unsafe { memmap2::MmapOptions::new().len(size as usize).map(&file) }
+                    .map_err(|e| Fault::unavailable(e.to_string()))?;
+                let pool = shm.create_pool(file.as_fd(), size as i32, &self.queue.handle(), ());
+                let released = Arc::new(AtomicBool::new(true));
+                let buffer = pool.create_buffer(
+                    0,
+                    width as i32,
+                    height as i32,
+                    stride as i32,
+                    format,
+                    &self.queue.handle(),
+                    released.clone(),
+                );
+                self.capture_buffers.push(CaptureBuffer {
+                    key,
+                    buffer,
+                    pool,
+                    mapping: Arc::new(mapping),
+                    released,
+                });
+                self.capture_buffers.len() - 1
+            }
+            None => {
+                return Err(Fault::new(
+                    ErrorCode::Busy,
+                    "显示缓冲区仍在使用，丢弃过时帧",
+                ));
+            }
+        };
+        let buffer = &self.capture_buffers[slot];
+        buffer.released.store(false, Ordering::Release);
+        if damage && frame.0.version() >= 2 {
+            frame.0.copy_with_damage(&buffer.buffer);
+        } else {
+            frame.0.copy(&buffer.buffer);
+        }
+        // A static image waits for damage without repeatedly copying pixels.
+        // The preview cancellation generation changes on resize/hide/close.
+        let deadline = Instant::now() + Duration::from_secs(if damage { 3600 } else { 4 });
+        while (!self.state.frame_ready
+            || (damage && !self.capture_buffers[slot].released.load(Ordering::Acquire)))
+            && !self.state.frame_failed
+        {
             self.step(cancel, deadline)?;
         }
-        frame.destroy();
-        buffer.destroy();
-        pool.destroy();
         if self.state.frame_failed {
             return Err(Fault::unavailable("截图传输失败"));
         }
-        let mut bytes = vec![0; size as usize];
-        file.read_exact(&mut bytes)
-            .map_err(|e| Fault::unavailable(e.to_string()))?;
-        let rgba = decode_shm(&bytes, format, width, height, stride, self.state.inverted)?;
-        let image = image::RgbaImage::from_raw(width, height, rgba)
-            .ok_or_else(|| Fault::unavailable("图像长度无效"))?;
+        let mapping = self.capture_buffers[slot].mapping.clone();
+        if !damage {
+            // niri reports completed screenshot contents through frame.ready,
+            // without wl_buffer.release. Standalone PNG captures never recycle
+            // these buffers; the returned mapping keeps their pixels alive.
+            self.capture_buffers.clear();
+        }
+        if cfg!(target_endian = "little")
+            && output.transform == wl_output::Transform::Normal
+            && !self.state.inverted
+        {
+            let format = match format {
+                wl_shm::Format::Argb8888 => PixelFormat::Bgra,
+                wl_shm::Format::Xrgb8888 => PixelFormat::Bgrx,
+                wl_shm::Format::Abgr8888 => PixelFormat::Rgba,
+                wl_shm::Format::Xbgr8888 => PixelFormat::Rgbx,
+                _ => return Err(Fault::unsupported("不支持的 SHM 像素格式")),
+            };
+            return Ok(RawFrame {
+                pixels: Pixels::Shared(mapping),
+                width,
+                height,
+                stride,
+                format,
+            });
+        }
+        let rgba = decode_shm(&mapping, format, width, height, stride, self.state.inverted)?;
+        let image = image::RgbaImage::from_raw(width, height, rgba).unwrap();
         let image = orient(image, output.transform);
         let (width, height) = image.dimensions();
-        let mut png = std::io::Cursor::new(Vec::new());
-        image
-            .write_to(&mut png, image::ImageFormat::Png)
-            .map_err(|e| Fault::unavailable(e.to_string()))?;
-        Ok((
-            base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+        Ok(RawFrame {
+            pixels: Pixels::Owned(image.into_raw()),
             width,
             height,
-        ))
+            stride: width * 4,
+            format: PixelFormat::Rgba,
+        })
     }
     pub fn input(
         &mut self,
@@ -729,6 +880,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WireState {
                 "wl_seat" if state.seat.is_none() => {
                     state.seat = Some(registry.bind(name, version.min(7), qh, ()))
                 }
+                "zwp_linux_dmabuf_v1" if version >= 3 => {
+                    state.dma = Some(registry.bind(name, 3, qh, ()));
+                }
                 "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
                 "zwlr_screencopy_manager_v1" => {
                     state.copy = Some(registry.bind(name, version.min(3), qh, ()))
@@ -808,15 +962,18 @@ impl Dispatch<wl_callback::WlCallback, ()> for WireState {
         state.synced = true;
     }
 }
-impl Dispatch<frame::ZwlrScreencopyFrameV1, ()> for WireState {
+impl Dispatch<frame::ZwlrScreencopyFrameV1, u64> for WireState {
     fn event(
         state: &mut Self,
         _: &frame::ZwlrScreencopyFrameV1,
         event: frame::Event,
-        _: &(),
+        capture_id: &u64,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if *capture_id != state.capture_id {
+            return;
+        }
         match event {
             frame::Event::Buffer {
                 format: WEnum::Value(format),
@@ -824,6 +981,14 @@ impl Dispatch<frame::ZwlrScreencopyFrameV1, ()> for WireState {
                 height,
                 stride,
             } => state.dimensions = Some((format, width, height, stride)),
+            frame::Event::LinuxDmabuf {
+                format,
+                width,
+                height,
+            } => {
+                state.dma_dimensions = Some((format, width, height));
+            }
+            frame::Event::BufferDone => state.formats_done = true,
             frame::Event::Ready { .. } => state.frame_ready = true,
             frame::Event::Failed => state.frame_failed = true,
             frame::Event::Flags {
@@ -836,7 +1001,20 @@ impl Dispatch<frame::ZwlrScreencopyFrameV1, ()> for WireState {
 delegate_noop!(WireState: ignore wl_seat::WlSeat);
 delegate_noop!(WireState: ignore wl_shm::WlShm);
 delegate_noop!(WireState: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(WireState: ignore wl_buffer::WlBuffer);
+impl Dispatch<wl_buffer::WlBuffer, Arc<AtomicBool>> for WireState {
+    fn event(
+        _: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        released: &Arc<AtomicBool>,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_buffer::Event::Release = event {
+            released.store(true, Ordering::Release);
+        }
+    }
+}
 delegate_noop!(WireState: ignore copy::ZwlrScreencopyManagerV1);
 delegate_noop!(WireState: ignore pointer_manager::ZwlrVirtualPointerManagerV1);
 delegate_noop!(WireState: ignore pointer::ZwlrVirtualPointerV1);

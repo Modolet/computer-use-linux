@@ -8,6 +8,9 @@ set -euo pipefail
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 
 if [[ "${COMPUTER_USE_UI_TEST:-}" != 1 ]]; then
+	cargo build --example preview-probe
+	COMPUTER_USE_PREVIEW_PROBE="$(readlink -f target/debug/examples/preview-probe)"
+	export COMPUTER_USE_PREVIEW_PROBE
 	test_runtime=$(mktemp -d /tmp/cv-XXXXXX)
 	mkdir -p "$test_runtime/home" "$test_runtime/cache"
 	exec env HOME="$test_runtime/home" XDG_CACHE_HOME="$test_runtime/cache" XDG_RUNTIME_DIR="$test_runtime" \
@@ -17,7 +20,8 @@ if [[ "${COMPUTER_USE_UI_TEST:-}" != 1 ]]; then
 fi
 
 printf 'output HEADLESS-1 mode 1280x900\nxwayland disable\nfont monospace 10\n' >"$XDG_RUNTIME_DIR/visual.config"
-WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER=pixman \
+WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER="${COMPUTER_USE_TEST_RENDERER:-pixman}" \
+	WLR_RENDER_DRM_DEVICE="${COMPUTER_USE_RENDER_DRM_DEVICE:-/dev/dri/renderD128}" \
 	sway --config "$XDG_RUNTIME_DIR/visual.config" >"$XDG_RUNTIME_DIR/visual.log" 2>&1 &
 test_compositor=$!
 trap 'kill "$test_compositor" 2>/dev/null || true; wait "$test_compositor" 2>/dev/null || true' EXIT
@@ -33,6 +37,11 @@ for _ in {1..100}; do
 	sleep 0.05
 done
 test -n "${WAYLAND_DISPLAY:-}"
-export GDK_BACKEND=wayland GTK_A11Y=none GTK_USE_PORTAL=0 GSK_RENDERER=cairo
+export GDK_BACKEND=wayland GTK_A11Y=none GTK_USE_PORTAL=0 GSK_RENDERER="${COMPUTER_USE_TEST_GSK_RENDERER:-cairo}"
 unset DISPLAY WAYLAND_SOCKET NIRI_SOCKET SWAYSOCK
-cargo test --lib visible_window_allows_ai_and_closing_pauses -- --ignored --nocapture --test-threads=1
+if [[ -n "${COMPUTER_USE_UI_FILTER:-}" ]]; then
+	cargo test --lib "$COMPUTER_USE_UI_FILTER" -- --ignored --nocapture --test-threads=1
+else
+	cargo test --lib visible_window_allows_ai_and_closing_pauses -- --ignored --nocapture --test-threads=1
+	cargo test --lib realtime_preview_native_pixels_and_presentation_rate -- --ignored --nocapture --test-threads=1
+fi

@@ -17,6 +17,7 @@
         pkgs: with pkgs; [
           gtk4
           glib
+          libgbm
           libxkbcommon
           wayland
         ];

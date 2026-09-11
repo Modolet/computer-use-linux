@@ -5,6 +5,7 @@
 
 use super::{
     Backend, Cancellation,
+    preview::{self, Viewport},
     process::{ProcessIdentity, descendant},
     wayland::Wayland,
 };
@@ -72,6 +73,12 @@ pub struct SavedSession {
     pub bus: ProcessIdentity,
     pub socket: PathBuf,
     pub wayland: PathBuf,
+    #[serde(default = "legacy_renderer")]
+    pub renderer: String,
+}
+
+fn legacy_renderer() -> String {
+    "旧实例 · 渲染方式未知".into()
 }
 
 struct StartupGuard(Vec<ProcessIdentity>);
@@ -235,65 +242,8 @@ impl Isolated {
         let mut startup = StartupGuard(vec![bus_identity.clone()]);
         let config = runtime.join("sway.config");
         fs::write(&config, "output HEADLESS-1 mode 1280x800\nseat seat0 fallback true\nfocus_on_window_activation none\nfocus_follows_mouse no\nfont monospace 10\nxwayland disable\ndefault_border none\n").map_err(|e| Fault::unavailable(e.to_string()))?;
-        let log = fs::File::create(runtime.join("sway.log"))
-            .map_err(|e| Fault::unavailable(e.to_string()))?;
-        let mut sway = command("sway", &runtime, &bus)
-            .args(["--config"])
-            .arg(&config)
-            .env("WLR_BACKENDS", "headless")
-            .env("WLR_HEADLESS_OUTPUTS", "1")
-            .env("WLR_LIBINPUT_NO_DEVICES", "1")
-            .env("WLR_RENDERER", "pixman")
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .map_err(|e| Fault::unavailable(format!("启动 Sway: {e}")))?;
+        let (mut sway, wayland, socket, renderer) = start_compositor(&runtime, &bus, &config)?;
         startup.0.push(ProcessIdentity::read(sway.id())?);
-        let deadline = Instant::now() + Duration::from_secs(12);
-        let (wayland, socket) = loop {
-            if sway
-                .try_wait()
-                .map_err(|e| Fault::unavailable(e.to_string()))?
-                .is_some()
-            {
-                return Err(Fault::unavailable(format!(
-                    "Sway 已退出；查看 {}",
-                    runtime.join("sway.log").display()
-                )));
-            }
-            let path = fs::read_dir(&runtime)
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .find(|p| {
-                    p.file_name().is_some_and(|n| {
-                        n.to_string_lossy().starts_with("wayland-")
-                            && !n.to_string_lossy().ends_with(".lock")
-                    })
-                });
-            let socket = fs::read_dir(&runtime)
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .find(|p| {
-                    p.file_name().is_some_and(|n| {
-                        n.to_string_lossy().starts_with("sway-ipc.")
-                            && n.to_string_lossy().ends_with(".sock")
-                    })
-                });
-            if let (Some(path), Some(socket)) = (path, socket) {
-                break (path, socket);
-            }
-            if Instant::now() > deadline {
-                let _ = sway.kill();
-                return Err(Fault::unavailable("独立 Sway 启动超时"));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
         let sway_identity = ProcessIdentity::read(sway.id())?;
         let activation = command("dbus-update-activation-environment", &runtime, &bus)
             .arg(format!("WAYLAND_DISPLAY={}", wayland.display()))
@@ -387,6 +337,7 @@ impl Isolated {
         let saved = SavedSession {
             id: id.clone(),
             application,
+            renderer,
             runtime,
             sway: sway_identity,
             app: identity,
@@ -489,6 +440,60 @@ impl Isolated {
         signature.push(serde_json::json!(outputs));
         Ok(serde_json::to_string(&signature).unwrap())
     }
+    fn human_input(
+        &mut self,
+        expected: Option<&Target>,
+        action: &Action,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        // A local input connection has no AI observation authority and need not
+        // capture/encode the entire screen before every key or click.
+        if !self.local_only {
+            let mut view = self
+                .local_view()?
+                .ok_or_else(|| Fault::unavailable("本地视图不可用"))?;
+            return match expected {
+                Some(target) => view.human_act_at(target, action, cancel),
+                None => view.human_act(action, cancel),
+            };
+        }
+        self.input.refresh(cancel)?;
+        let output = self
+            .input
+            .outputs()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Fault::stale("虚拟输出已关闭"))?;
+        let (width, height) = output.image_size();
+        let target = Target {
+            id: self.target_id.clone(),
+            label: self.saved.application.label().into(),
+            width,
+            height,
+            scale: self.scale(&output.name)?,
+        };
+        if expected.is_some_and(|old| {
+            old.id != target.id
+                || old.width != width
+                || old.height != height
+                || old.scale != target.scale
+        }) {
+            return Err(Fault::stale("预览尺寸已变化，请等待新画面后操作"));
+        }
+        self.geometry = Some((self.check_windows()?, self.input.revision()));
+        action.validate(width, height)?;
+        self.act(
+            &Observation {
+                observation_id: String::new(),
+                target,
+                png_base64: None,
+                nodes: vec![],
+                windows: vec![],
+            },
+            action,
+            cancel,
+        )
+    }
     fn cancel() -> Cancellation {
         Cancellation::new(Arc::new(AtomicU64::new(0)))
     }
@@ -517,13 +522,26 @@ impl Backend for Isolated {
             local_only: true,
         })))
     }
+    fn realtime_preview(&self) -> Result<Box<dyn preview::Source>> {
+        Ok(Box::new(IsolatedPreview {
+            saved: self.saved.clone(),
+            target_id: self.target_id.clone(),
+            viewport: None,
+            revision: 0,
+            scale: 1.0,
+            wire: Wayland::connect(&self.saved.wayland, &Self::cancel())?,
+        }))
+    }
     fn human_act(&mut self, action: &Action, cancel: &Cancellation) -> Result<()> {
-        let mut local = self
-            .local_view()?
-            .ok_or_else(|| Fault::unavailable("本地视图不可用"))?;
-        let observation = local.observe(None, cancel)?;
-        action.validate(observation.target.width, observation.target.height)?;
-        local.act(&observation, action, cancel)
+        self.human_input(None, action, cancel)
+    }
+    fn human_act_at(
+        &mut self,
+        target: &Target,
+        action: &Action,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        self.human_input(Some(target), action, cancel)
     }
     fn survives_revoke(&self) -> bool {
         true
@@ -632,4 +650,233 @@ impl Backend for Isolated {
     fn alive(&mut self) -> bool {
         self.saved.sway.alive() && self.saved.app.alive()
     }
+}
+
+struct IsolatedPreview {
+    saved: SavedSession,
+    target_id: String,
+    viewport: Option<Viewport>,
+    revision: u64,
+    scale: f64,
+    wire: Wayland,
+}
+impl preview::Source for IsolatedPreview {
+    fn dma_formats(&mut self, formats: Vec<(u32, u64)>) {
+        // Resolve the render node actually opened by our compositor, including
+        // multi-GPU systems. Validate its process lifetime before reading fds.
+        let device = self
+            .saved
+            .sway
+            .alive()
+            .then(|| {
+                fs::read_dir(format!("/proc/{}/fd", self.saved.sway.pid))
+                    .ok()?
+                    .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+                    .find(|path| {
+                        path.parent() == Some(Path::new("/dev/dri"))
+                            && path
+                                .file_name()
+                                .is_some_and(|name| name.to_string_lossy().starts_with("renderD"))
+                    })
+            })
+            .flatten();
+        self.wire.configure_dma(device.as_deref(), formats);
+    }
+    fn resize(&mut self, viewport: Viewport, cancel: &Cancellation) -> Result<()> {
+        cancel.check()?;
+        Viewport::new(viewport.width, viewport.height, viewport.scale)?;
+        if self.viewport == Some(viewport) {
+            return Ok(());
+        }
+        if !self.saved.sway.alive() || !self.saved.app.alive() {
+            return Err(Fault::stale("独立应用已退出"));
+        }
+        let response = sway_request(
+            &self.saved.socket,
+            0,
+            &format!(
+                "output HEADLESS-1 mode {}x{}@60Hz scale {:.3}",
+                viewport.width, viewport.height, viewport.scale
+            ),
+        )?;
+        if !response.as_array().is_some_and(|items| {
+            !items.is_empty() && items.iter().all(|item| item["success"] == true)
+        }) {
+            return Err(Fault::unavailable("无法调整独立输出尺寸"));
+        }
+        self.wire.refresh(cancel)?;
+        self.viewport = Some(viewport);
+        Ok(())
+    }
+    fn frame(&mut self, cancel: &Cancellation) -> Result<preview::Frame> {
+        if !self.saved.sway.alive() || !self.saved.app.alive() {
+            return Err(Fault::stale("独立应用已退出"));
+        }
+        self.wire.refresh(cancel)?;
+        if self.revision != self.wire.revision() {
+            let outputs = sway_request(&self.saved.socket, 3, "")?;
+            self.scale = outputs
+                .as_array()
+                .and_then(|outputs| outputs.iter().find(|o| o["name"] == "HEADLESS-1"))
+                .and_then(|output| output["scale"].as_f64())
+                .ok_or_else(|| Fault::stale("虚拟输出缩放无效"))?;
+            self.revision = self.wire.revision();
+        }
+        let output = self.wire.output("HEADLESS-1")?;
+        let image = self.wire.capture_preview(&output, cancel)?;
+        let (width, height) = image.size();
+        cancel.check()?;
+        if self.wire.revision() != self.revision {
+            return Err(Fault::new(ErrorCode::Busy, "输出尺寸变化，等待下一帧"));
+        }
+        let target = Target {
+            id: self.target_id.clone(),
+            label: self.saved.application.label().into(),
+            width,
+            height,
+            scale: self.scale,
+        };
+        Ok(preview::Frame {
+            image,
+            target,
+            renderer: self.saved.renderer.clone(),
+            ready_at: Instant::now(),
+        })
+    }
+}
+
+fn start_compositor(
+    runtime: &Path,
+    bus: &str,
+    config: &Path,
+) -> Result<(std::process::Child, PathBuf, PathBuf, String)> {
+    let requested = std::env::var("COMPUTER_USE_RENDERER").unwrap_or_else(|_| "auto".into());
+    if !matches!(requested.as_str(), "auto" | "gles2" | "pixman") {
+        return Err(Fault::unavailable(
+            "COMPUTER_USE_RENDERER 必须为 auto、gles2 或 pixman",
+        ));
+    }
+    let mut devices: Vec<PathBuf> =
+        if let Some(device) = std::env::var_os("COMPUTER_USE_RENDER_DRM_DEVICE") {
+            vec![PathBuf::from(device)]
+        } else {
+            fs::read_dir("/dev/dri")
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+                .map(|entry| entry.path())
+                .collect()
+        };
+    devices.sort();
+    let mut candidates: Vec<Option<PathBuf>> = if requested == "pixman" {
+        vec![]
+    } else {
+        devices
+            .into_iter()
+            .filter(|device| {
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(device)
+                    .is_ok()
+            })
+            .map(Some)
+            .collect()
+    };
+    if requested != "gles2" {
+        candidates.push(None);
+    }
+    let mut errors = vec![];
+    for device in candidates {
+        let renderer = if device.is_some() { "gles2" } else { "pixman" };
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(runtime.join("sway.log"))
+            .map_err(|e| Fault::unavailable(e.to_string()))?;
+        let mut cmd = command("sway", runtime, bus);
+        cmd.arg("--config")
+            .arg(config)
+            .env("WLR_BACKENDS", "headless")
+            .env("WLR_HEADLESS_OUTPUTS", "1")
+            .env("WLR_LIBINPUT_NO_DEVICES", "1")
+            .env("WLR_RENDERER", renderer)
+            .env_remove("WLR_RENDERER_FORCE_SOFTWARE")
+            .env_remove("WLR_RENDERER_ALLOW_SOFTWARE")
+            .env_remove("WLR_RENDER_DRM_DEVICE")
+            .stdout(Stdio::null())
+            .stderr(log);
+        if let Some(device) = &device {
+            cmd.env("WLR_RENDER_DRM_DEVICE", device);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Fault::unavailable(format!("启动 Sway: {e}")))?;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            if child
+                .try_wait()
+                .map_err(|e| Fault::unavailable(e.to_string()))?
+                .is_some()
+            {
+                break;
+            }
+            let paths: Vec<_> = fs::read_dir(runtime)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
+            let wayland = paths.iter().find(|p| {
+                p.file_name().is_some_and(|n| {
+                    n.to_string_lossy().starts_with("wayland-")
+                        && !n.to_string_lossy().ends_with(".lock")
+                })
+            });
+            let socket = paths.iter().find(|p| {
+                p.file_name().is_some_and(|n| {
+                    n.to_string_lossy().starts_with("sway-ipc.")
+                        && n.to_string_lossy().ends_with(".sock")
+                })
+            });
+            if let (Some(wayland), Some(socket)) = (wayland, socket)
+                && sway_request(socket, 3, "").is_ok()
+            {
+                let label = match &device {
+                    Some(device) => format!(
+                        "GPU · GLES2 ({})",
+                        device.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    None => "CPU · Pixman（兼容模式）".into(),
+                };
+                tracing::info!(%label, "独立桌面渲染器");
+                return Ok((child, wayland.clone(), socket.clone(), label));
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.wait();
+        errors.push(format!("{renderer} {:?}", device));
+        // No application has been started. Remove only this failed compositor's
+        // sockets, never the private D-Bus endpoint or any user application data.
+        for entry in fs::read_dir(runtime).ok().into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("wayland-") || name.starts_with("sway-ipc.") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        tracing::warn!(%renderer, "渲染器启动失败，尝试下一个本地渲染器；详情见 sway.log");
+    }
+    Err(Fault::unavailable(format!(
+        "无法启动独立渲染器（{}）；请检查 GPU 权限及 {}",
+        errors.join(", "),
+        runtime.join("sway.log").display()
+    )))
 }

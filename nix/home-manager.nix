@@ -31,6 +31,8 @@ in
       Service = {
         ExecStart = "${lib.getExe cfg.package} daemon";
         Restart = "on-failure";
+        # Retained application sessions must survive broker upgrades and restarts.
+        KillMode = "process";
         UMask = "0077";
       };
       Install.WantedBy = [ "graphical-session.target" ];

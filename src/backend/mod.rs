@@ -6,6 +6,8 @@
 use crate::model::*;
 pub mod applications;
 pub mod desktop;
+pub mod frame;
+pub mod preview;
 pub mod process;
 pub mod sway;
 pub mod wayland;
@@ -53,6 +55,13 @@ pub trait Backend: Send {
     /// A separate capture connection keeps the visible view live during input.
     fn local_view(&self) -> Result<Option<Box<dyn Backend>>> {
         Ok(None)
+    }
+    /// Private-session capture only; never exposed through MCP or global desktop input.
+    fn realtime_preview(&self) -> Result<Box<dyn preview::Source>> {
+        Err(Fault::unsupported("此后端不提供实时独立应用预览"))
+    }
+    fn human_act_at(&mut self, _: &Target, _: &Action, _: &Cancellation) -> Result<()> {
+        Err(Fault::unsupported("此后端不提供带画面坐标的本地接管"))
     }
     /// Only the local GTK takeover window calls this; never exposed over MCP/IPC.
     fn human_act(&mut self, _: &Action, _: &Cancellation) -> Result<()> {

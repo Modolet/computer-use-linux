@@ -9,6 +9,23 @@
 | 单应用：独立实例 | 已安装 Wayland 图形应用的截图、点击、拖动、滚动、组合键和 Unicode 文本 | 申请中指定应用，本地只需允许或拒绝；仅隔离图形会话，沿用个人 HOME、配置、登录状态和应用数据，默认显示实时窗口 |
 | 整个电脑 | niri 窗口切换、显示器截图；合成器开放协议时提供虚拟输入 | 使用真实桌面；最多一个整机会话执行输入 |
 
+## 实时预览
+
+新启动的独立会话默认优先使用 GPU GLES2 渲染。预览通过 GBM 分配独立 GPU 缓冲区，使用 Wayland screencopy 写入，再由 GTK 导入 DMA-BUF 显示；正常路径不经过 PNG、Base64、CPU 像素读回或重新上传。MCP 的 `observe` 仍按需返回 PNG，与持续预览各用独立连接。
+
+窗口调整大小后，虚拟输出会匹配视图的实际物理像素和显示器缩放，支持 1.25 等分数缩放。尺寸变化合并 120 ms，避免拖动边框时反复分配；每个视图最多保留 4 个采集缓冲区和一个待显示帧。画面无变化时等待 damage；窗口隐藏或关闭立即取消采集，最后一个视图隐藏时暂停 AI，重新显示不会擅自恢复授权。旧观察和手动输入坐标在尺寸变化后失效。
+
+状态栏显示物理分辨率、渲染器、传输方式（`DMA-BUF` / `SHM`）和更新帧率。目标刷新率为 60 FPS，静止画面显示“静止”。画质不做有损压缩，最高支持约 1600 万像素；实际帧率取决于 GPU、驱动、应用负载和宿主显示器刷新率。缺少兼容 DMA-BUF 格式时回退到有界共享内存帧，GPU 渲染不可用时回退到 CPU Pixman，并在界面标明。
+
+可通过守护进程环境变量配置：
+
+| 变量 | 默认与用途 |
+| --- | --- |
+| `COMPUTER_USE_RENDERER` | `auto`：优先 GPU，失败回退；`gles2`：要求 GPU，失败报错；`pixman`：CPU 兼容模式 |
+| `COMPUTER_USE_RENDER_DRM_DEVICE` | 自动探测可访问的 `/dev/dri/renderD*`；可指定某个渲染节点 |
+
+升级不会改变已运行实例的渲染器；旧实例仍可接管，新启动的实例使用新的 GPU 路径。Home Manager 服务重启只停止守护进程，保留应用及未保存内容，且不恢复 AI 授权。
+
 ## 安装和启动
 
 ```sh
@@ -126,6 +143,15 @@ nix develop --command bash tests/run-headless.sh
 测试覆盖连接隔离、授权前拒绝、暂停与撤销、过期引用、可见视图门控、真实 stdio MCP、Firefox 和编辑器的文本与快捷键、独立会话剪贴板隔离、尺寸变化和取消。
 
 可见窗口验收使用另一套专用测试桌面：`nix develop --command bash tests/run-visual.sh`。验证 GTK 窗口确实映射、实时画面显示期间 AI 可以继续输入，以及关闭窗口后自动暂停；同时验证独立实例申请没有应用选择器，且一次本地允许即可启动可见窗口并恢复控制。设置 `COMPUTER_USE_UI_PNG` 为绝对路径可保存该测试桌面的截图。
+
+实时预览验收（需要可访问的 GPU，运行于私有测试桌面）：
+
+```sh
+nix develop --command env COMPUTER_USE_RENDERER=gles2 COMPUTER_USE_MIN_FPS=40 bash tests/run-preview.sh
+nix develop --command env COMPUTER_USE_RENDERER=gles2 COMPUTER_USE_TEST_RENDERER=gles2 COMPUTER_USE_TEST_GSK_RENDERER=gl COMPUTER_USE_EXPECT_DMA=1 COMPUTER_USE_MIN_FPS=40 bash tests/run-visual.sh
+```
+
+测试覆盖 1080p、2400×1350 / 1.25 倍缩放、4K / 2 倍缩放，明确验证显示对象为 `GdkDmabufTexture`，检查像素颜色、旧帧租约不被覆盖、旧坐标失效、静止画面取消、隐藏与恢复。GPU 测试设置最低 40 FPS；CPU 兼容测试只检查画面与生命周期正确性。帧率统计表示 GTK 每秒接受的新画面数量，不等同于物理面板扫描或端到端延迟测量。
 
 真实 niri 后端验收：`nix develop --command bash tests/run-niri.sh`。测试在私有 Sway 内运行 niri，不向宿主发送输入；覆盖整机按键、点击、拖动、滚动、分数缩放、过期观察拒绝以及取消后的按键释放。
 

@@ -7,6 +7,8 @@ use crate::{
     backend::{
         Backend, Cancellation,
         desktop::Desktop,
+        frame::{DmaImage, Image, PixelFormat, RawFrame},
+        preview::{Stream, Viewport},
         sway::{Application, Isolated},
     },
     ipc::{self, SharedPolicy},
@@ -21,10 +23,10 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct Prepared {
@@ -65,6 +67,79 @@ fn texture(png: &str) -> Option<gdk::Texture> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(png).ok()?;
     gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
 }
+fn raw_texture(frame: RawFrame) -> gdk::MemoryTexture {
+    let format = match frame.format {
+        PixelFormat::Bgra => gdk::MemoryFormat::B8g8r8a8Premultiplied,
+        PixelFormat::Bgrx => gdk::MemoryFormat::B8g8r8x8,
+        PixelFormat::Rgba => gdk::MemoryFormat::R8g8b8a8Premultiplied,
+        PixelFormat::Rgbx => gdk::MemoryFormat::R8g8b8x8,
+    };
+    gdk::MemoryTexture::new(
+        frame.width as i32,
+        frame.height as i32,
+        format,
+        &glib::Bytes::from_owned(frame.pixels),
+        frame.stride as usize,
+    )
+}
+fn preview_texture(image: Image) -> Result<gdk::Texture> {
+    use glib::translate::*;
+    use std::os::fd::AsRawFd;
+    let Image::Dma(image) = image else {
+        let Image::Memory(frame) = image else {
+            unreachable!()
+        };
+        return Ok(raw_texture(frame).upcast());
+    };
+    let display =
+        gdk::Display::default().ok_or_else(|| Fault::unavailable("GTK display unavailable"))?;
+    let mut builder = gdk::DmabufTextureBuilder::new()
+        .set_display(&display)
+        .set_width(image.width)
+        .set_height(image.height)
+        .set_fourcc(image.fourcc)
+        .set_modifier(image.modifier)
+        .set_n_planes(image.planes.len() as u32)
+        .set_premultiplied(true);
+    for (index, plane) in image.planes.iter().enumerate() {
+        // SAFETY: the Arc lease below owns every fd until texture finalization.
+        builder = unsafe { builder.set_fd(index as u32, plane.fd.as_raw_fd()) }
+            .set_offset(index as u32, plane.offset)
+            .set_stride(index as u32, plane.stride);
+    }
+    unsafe extern "C" fn release(data: glib::ffi::gpointer) {
+        // SAFETY: exactly one successful GDK texture owns this boxed lease.
+        unsafe {
+            drop(Box::<Arc<DmaImage>>::from_raw(data.cast()));
+        }
+    }
+    let lease = Box::into_raw(Box::new(image));
+    // SAFETY: valid builder/plane fds. GDK takes the callback on successful
+    // construction only; on failure we reclaim it ourselves. Using the FFI here
+    // also avoids leaking the closure in gtk-rs build_with_release_func's error path.
+    unsafe {
+        let mut error = std::ptr::null_mut();
+        let texture = gdk::ffi::gdk_dmabuf_texture_builder_build(
+            builder.to_glib_none().0,
+            Some(release),
+            lease.cast(),
+            &mut error,
+        );
+        if texture.is_null() {
+            drop(Box::from_raw(lease));
+            let message = if error.is_null() {
+                "GTK 不支持此 DMA-BUF".into()
+            } else {
+                let error: glib::Error = from_glib_full(error);
+                error.to_string()
+            };
+            Err(Fault::unavailable(message))
+        } else {
+            Ok(from_glib_full(texture))
+        }
+    }
+}
+#[cfg(test)]
 fn uncancelled() -> Cancellation {
     Cancellation::new(Arc::new(AtomicU64::new(0)))
 }
@@ -605,9 +680,6 @@ fn preview(
     policy: SharedPolicy,
     session_id: Option<String>,
 ) {
-    if let Some(id) = &session_id {
-        policy.lock().unwrap().view_opened(id);
-    }
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("独立应用 · 实时画面")
@@ -621,13 +693,12 @@ fn preview(
     outer.append(&status);
     let picture = gtk::Picture::new();
     picture.set_vexpand(true);
+    picture.set_hexpand(true);
     picture.set_can_shrink(true);
     picture.set_focusable(true);
     outer.append(&picture);
     window.set_child(Some(&outer));
-    let current = Rc::new(RefCell::new(None::<Observation>));
-    let (sender, receiver) = mpsc::channel::<Result<Observation>>();
-    let busy = Arc::new(AtomicBool::new(false));
+    let current = Rc::new(RefCell::new(None::<Target>));
     let alive = Rc::new(Cell::new(true));
     let manual_generation = Arc::new(AtomicU64::new(0));
     let manual_active = Rc::new(Cell::new(false));
@@ -646,7 +717,6 @@ fn preview(
     });
     let a = alive.clone();
     let close_policy = policy.clone();
-    let id = session_id.clone();
     let generation = manual_generation.clone();
     window.connect_close_request(move |_| {
         a.set(false);
@@ -655,12 +725,10 @@ fn preview(
         if manual_active.get() {
             p.manual_previews = p.manual_previews.saturating_sub(1);
         }
-        if let Some(id) = &id {
-            p.view_closed(id);
-        }
         glib::Propagation::Proceed
     });
-    let (action_sender, action_receiver) = mpsc::sync_channel::<(Action, Cancellation)>(128);
+    let (action_sender, action_receiver) =
+        mpsc::sync_channel::<(Target, Action, Cancellation)>(128);
     let text_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let entry = gtk::Entry::builder()
         .placeholder_text("接管后可在这里使用中文输入法，再发送到应用")
@@ -670,11 +738,14 @@ fn preview(
     let enabled = takeover.clone();
     let text_sender = action_sender.clone();
     let generation = manual_generation.clone();
+    let text_target = current.clone();
     button("发送文本", &text_row, move || {
         if enabled.is_active()
+            && let Some(target) = text_target.borrow().as_ref()
             && !entry.text().is_empty()
             && text_sender
                 .try_send((
+                    target.clone(),
                     Action::Text {
                         text: entry.text().to_string(),
                     },
@@ -686,63 +757,169 @@ fn preview(
         }
     });
     outer.append(&text_row);
-    let human_backend = backend.clone();
+    let human_backend = backend.lock().unwrap().local_view();
+    let human_serial = backend.clone();
     std::thread::spawn(move || {
-        while let Ok((action, cancel)) = action_receiver.recv() {
+        let Ok(Some(mut human_backend)) = human_backend else {
+            return;
+        };
+        while let Ok((target, action, cancel)) = action_receiver.recv() {
+            // Keep local input inside the same pause/authorization release barrier.
+            let _serial = human_serial.lock().unwrap();
             if cancel.check().is_err() {
                 continue;
             }
-            if let Ok(mut b) = human_backend.lock() {
-                let _ = b.human_act(&action, &cancel);
-            }
+            let _ = human_backend.human_act_at(&target, &action, &cancel);
         }
     });
-    let pic = picture.clone();
+    let visible_policy = policy.clone();
+    let visible_id = session_id.clone();
+    picture.connect_map(move |_| {
+        if let Some(id) = &visible_id {
+            visible_policy.lock().unwrap().view_opened(id);
+        }
+    });
+    let hidden_policy = policy.clone();
+    let hidden_id = session_id.clone();
+    let hidden_generation = manual_generation.clone();
+    picture.connect_unmap(move |_| {
+        hidden_generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(id) = &hidden_id {
+            hidden_policy.lock().unwrap().view_closed(id);
+        }
+    });
+    let source = backend.lock().unwrap().realtime_preview();
+    let stream = match source {
+        Ok(mut source) => {
+            if let Some(display) = gdk::Display::default() {
+                let _ = display.prepare_gl();
+                let formats = display.dmabuf_formats();
+                source.dma_formats(
+                    (0..formats.n_formats())
+                        .map(|i| formats.format(i))
+                        .collect(),
+                );
+            }
+            Rc::new(Stream::start(source))
+        }
+        Err(error) => {
+            status.set_text(&error.message);
+            if let Some(id) = &session_id {
+                policy.lock().unwrap().pause(id);
+            }
+            window.present();
+            return;
+        }
+    };
+    let mapped_stream = stream.clone();
+    picture.connect_map(move |_| mapped_stream.visible(true));
+    let hidden_stream = stream.clone();
+    picture.connect_unmap(move |_| hidden_stream.visible(false));
+    let closing_stream = stream.clone();
+    window.connect_close_request(move |_| {
+        closing_stream.stop();
+        glib::Propagation::Proceed
+    });
     let state = current.clone();
-    let b = backend
-        .lock()
-        .unwrap()
-        .local_view()
-        .ok()
-        .flatten()
-        .map(|view| Arc::new(Mutex::new(view)))
-        .unwrap_or_else(|| backend.clone());
     let p = policy.clone();
     let id = session_id;
-    glib::timeout_add_local(Duration::from_millis(300), move || {
+    let presentation = RefCell::new((
+        None,
+        Instant::now(),
+        Instant::now(),
+        0u64,
+        String::new(),
+        None::<String>,
+    ));
+    picture.add_tick_callback(move |picture, _clock| {
+        let mut presentation = presentation.borrow_mut();
+        let (pending_size, size_changed, measured_since, shown_frames, description, failure) =
+            &mut *presentation;
         if !alive.get() {
             return glib::ControlFlow::Break;
         }
-        for result in receiver.try_iter() {
-            match result {
-                Ok(o) => {
-                    if let Some(t) = o.png_base64.as_deref().and_then(texture) {
-                        pic.set_paintable(Some(&t));
-                    }
-                    *state.borrow_mut() = Some(o);
-                }
-                Err(e) => status.set_text(&e.message),
+        let scale = picture
+            .native()
+            .and_then(|native| native.surface())
+            .map(|surface| surface.scale())
+            .unwrap_or(f64::from(picture.scale_factor()));
+        let viewport = Viewport::new(
+            (f64::from(picture.width()) * scale).round() as u32,
+            (f64::from(picture.height()) * scale).round() as u32,
+            scale,
+        );
+        if let Ok(viewport) = viewport {
+            if *pending_size != Some(viewport) {
+                *pending_size = Some(viewport);
+                *size_changed = Instant::now();
+            }
+            // Coalesce window drag allocations; settled sizes render at native
+            // physical pixels, including fractional monitor scales.
+            if size_changed.elapsed() >= Duration::from_millis(120) {
+                stream.configure(viewport);
             }
         }
-        if let Some(id) = &id
-            && let Some(session) = p.lock().unwrap().sessions.get(id)
-        {
-            status.set_text(match session.status.state {
-                State::Active => "AI 正在控制此应用 · 你可以继续使用其他窗口",
-                State::Paused => "AI 已暂停 · 可手动接管，或在权限面板恢复",
-                _ => "AI 授权已结束 · 应用保留供你使用",
-            });
-        }
-        if !busy.swap(true, Ordering::SeqCst) {
-            let sender = sender.clone();
-            let backend = b.clone();
-            let busy = busy.clone();
-            std::thread::spawn(move || {
-                if let Ok(mut b) = backend.try_lock() {
-                    let _ = sender.send(b.preview(&uncancelled()));
+        if let Some(result) = stream.take() {
+            match result {
+                Ok(frame) => {
+                    // A late frame from a slow consumer must not add visible lag.
+                    if frame.ready_at.elapsed() < Duration::from_millis(250) {
+                        let (width, height) = frame.image.size();
+                        *description = format!(
+                            "{width}×{height} · {} · {}",
+                            frame.renderer,
+                            frame.image.transport()
+                        );
+                        match preview_texture(frame.image) {
+                            Ok(texture) => picture.set_paintable(Some(&texture)),
+                            Err(error) => {
+                                tracing::warn!(%error, "GTK DMA-BUF 导入失败，切换共享内存");
+                                stream.fallback_to_memory();
+                                return glib::ControlFlow::Continue;
+                            }
+                        }
+                        *state.borrow_mut() = Some(frame.target);
+                        *shown_frames += 1;
+                        *failure = None;
+                    }
                 }
-                busy.store(false, Ordering::SeqCst);
-            });
+                Err(error) => {
+                    *failure = Some(error.message);
+                    if let Some(id) = &id {
+                        p.lock().unwrap().pause(id);
+                    }
+                }
+            }
+        }
+        if measured_since.elapsed() >= Duration::from_millis(500) {
+            let fps = *shown_frames as f64 / measured_since.elapsed().as_secs_f64();
+            let session_text = if let Some(id) = &id {
+                match p
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get(id)
+                    .map(|session| session.status.state.clone())
+                {
+                    Some(State::Active) => "AI 正在控制 · 你可以继续使用其他窗口",
+                    Some(State::Paused) => "AI 已暂停 · 可手动接管",
+                    _ => "AI 授权已结束 · 应用保留供你使用",
+                }
+            } else {
+                "本地预览 · 可手动接管"
+            };
+            if let Some(error) = failure.as_ref() {
+                status.set_text(error);
+            } else {
+                let rate = if *shown_frames == 0 {
+                    "静止".into()
+                } else {
+                    format!("{fps:.0} FPS")
+                };
+                status.set_text(&format!("{session_text} · {description} · {rate}"));
+            }
+            *shown_frames = 0;
+            *measured_since = Instant::now();
         }
         glib::ControlFlow::Continue
     });
@@ -767,6 +944,7 @@ fn preview(
                 _ => Button::Left,
             };
             let _ = sender.try_send((
+                o.clone(),
                 Action::Click { at, button },
                 Cancellation::new(generation.clone()),
             ));
@@ -809,7 +987,7 @@ fn preview(
             } else {
                 Action::Drag { from, to }
             };
-            let _ = sender.try_send((action, cancel));
+            let _ = sender.try_send((o.clone(), action, cancel));
         }
     });
     picture.add_controller(drag);
@@ -833,6 +1011,7 @@ fn preview(
             && let Some(at) = picture_point(&pic, o, x, y)
         {
             let _ = sender.try_send((
+                o.clone(),
                 Action::Scroll {
                     at,
                     dx: (dx * 40.0).clamp(-1000.0, 1000.0),
@@ -847,6 +1026,7 @@ fn preview(
     let key = gtk::EventControllerKey::new();
     let enable = takeover.clone();
     let generation = manual_generation.clone();
+    let key_target = current.clone();
     key.connect_key_pressed(move |_, key, _, state| {
         if !enable.is_active() {
             return glib::Propagation::Proceed;
@@ -867,8 +1047,11 @@ fn preview(
             .filter(|c| !c.is_control())
             .map(|c| c.to_string())
             .or_else(|| key.name().map(|s| s.to_string()));
-        if let Some(key) = name {
+        if let Some(key) = name
+            && let Some(target) = key_target.borrow().as_ref()
+        {
             let _ = action_sender.try_send((
+                target.clone(),
                 Action::Key { key, modifiers },
                 Cancellation::new(generation.clone()),
             ));
@@ -878,9 +1061,9 @@ fn preview(
     picture.add_controller(key);
     window.present();
 }
-fn picture_point(picture: &gtk::Picture, o: &Observation, x: f64, y: f64) -> Option<Point> {
-    let w = f64::from(o.target.width);
-    let h = f64::from(o.target.height);
+fn picture_point(picture: &gtk::Picture, o: &Target, x: f64, y: f64) -> Option<Point> {
+    let w = f64::from(o.width);
+    let h = f64::from(o.height);
     let scale = (f64::from(picture.width()) / w).min(f64::from(picture.height()) / h);
     let left = (f64::from(picture.width()) - w * scale) / 2.0;
     let top = (f64::from(picture.height()) - h * scale) / 2.0;
@@ -897,14 +1080,10 @@ mod tests {
     use std::time::Instant;
 
     fn pump(duration: Duration) {
-        let deadline = Instant::now() + duration;
-        let context = glib::MainContext::default();
-        while Instant::now() < deadline {
-            while context.pending() {
-                context.iteration(false);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let loop_ = glib::MainLoop::new(None, false);
+        let quit = loop_.clone();
+        glib::timeout_add_local_once(duration, move || quit.quit());
+        loop_.run();
     }
 
     #[test]
@@ -955,6 +1134,22 @@ mod tests {
             "请使用 tests/run-visual.sh 的专用测试桌面"
         );
         gtk::init().unwrap();
+        // An unsupported import must release its fd lease and leave the display
+        // usable for the following successful DMA-BUF / SHM preview.
+        let rejected = Arc::new(DmaImage {
+            width: 64,
+            height: 64,
+            fourcc: 0xdeadbeef,
+            modifier: 0,
+            planes: vec![crate::backend::frame::DmaPlane {
+                fd: tempfile::tempfile().unwrap().into(),
+                offset: 0,
+                stride: 256,
+            }],
+        });
+        let released = Arc::downgrade(&rejected);
+        assert!(preview_texture(Image::Dma(rejected)).is_err());
+        assert!(released.upgrade().is_none(), "失败导入必须释放帧租约");
         let app = gtk::Application::builder()
             .application_id("io.github.computer_use_linux.UiTest")
             .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
@@ -1096,6 +1291,19 @@ mod tests {
             )
             .unwrap();
         }
+        window.set_visible(false);
+        pump(Duration::from_millis(100));
+        assert_eq!(
+            policy.lock().unwrap().status(owner, &id).unwrap().state,
+            State::Paused
+        );
+        window.present();
+        pump(Duration::from_millis(100));
+        assert_eq!(
+            policy.lock().unwrap().status(owner, &id).unwrap().state,
+            State::Paused,
+            "重新显示不能擅自恢复 AI"
+        );
         window.close();
         pump(Duration::from_millis(100));
         assert_eq!(
@@ -1104,6 +1312,172 @@ mod tests {
         );
         check_single_allow_flow(&app);
     }
+    #[test]
+    #[ignore = "需要 tests/run-visual.sh 的独立图形桌面"]
+    fn realtime_preview_native_pixels_and_presentation_rate() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+        use crate::backend::{
+            applications::DesktopApplication,
+            sway::{SavedSession, sway_request},
+        };
+        use std::path::PathBuf;
+        let runtime = PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap());
+        assert!(runtime.to_string_lossy().starts_with("/tmp/cv-"));
+        assert_eq!(
+            PathBuf::from(std::env::var("HOME").unwrap()),
+            runtime.join("home")
+        );
+        let socket = std::fs::read_dir(&runtime)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy().starts_with("sway-ipc.")
+                        && name.to_string_lossy().ends_with(".sock")
+                })
+            })
+            .unwrap();
+        gtk::init().unwrap();
+        let app = gtk::Application::builder()
+            .application_id("io.github.computer_use_linux.PreviewTest")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let isolated = Isolated::launch(Application::Installed(DesktopApplication {
+            id: "preview-probe.desktop".into(),
+            name: "Preview probe".into(),
+            program: PathBuf::from(std::env::var("COMPUTER_USE_PREVIEW_PROBE").unwrap()),
+            args: vec![],
+            directory: None,
+            desktop_file: runtime.join("probe.desktop"),
+        }))
+        .unwrap();
+        struct Cleanup(SavedSession);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for p in [&self.0.app, &self.0.sway, &self.0.bus] {
+                    p.terminate();
+                }
+            }
+        }
+        let _cleanup = Cleanup(isolated.saved.clone());
+        println!("PREVIEW_RENDERER {}", isolated.saved.renderer);
+        let backend: BackendHandle = Arc::new(Mutex::new(Box::new(isolated)));
+        preview(&app, backend, Arc::new(Mutex::new(Policy::default())), None);
+        let window = app.windows().into_iter().next().unwrap();
+        let picture = window
+            .child()
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .next_sibling()
+            .unwrap()
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::Picture>()
+            .unwrap();
+        let frames = Rc::new(Cell::new(0u32));
+        let displayed = frames.clone();
+        picture.connect_paintable_notify(move |_| displayed.set(displayed.get() + 1));
+        for (mode, scale) in [("1920x1080", 1.0), ("2400x1350", 1.25), ("3840x2160", 2.0)] {
+            sway_request(
+                &socket,
+                0,
+                &format!("output HEADLESS-1 mode {mode} scale {scale}"),
+            )
+            .unwrap();
+            pump(Duration::from_secs(2));
+            let held = picture
+                .paintable()
+                .unwrap()
+                .downcast::<gdk::Texture>()
+                .unwrap();
+            let actual_scale = window.surface().unwrap().scale();
+            println!("TEXTURE {}", held.type_().name());
+            if std::env::var("COMPUTER_USE_EXPECT_DMA").as_deref() == Ok("1") {
+                assert!(
+                    held.is::<gdk::DmabufTexture>(),
+                    "GPU 验收必须实际使用 DMA-BUF"
+                );
+            }
+            assert_eq!(actual_scale, scale);
+            assert_eq!(
+                held.width(),
+                (f64::from(picture.width()) * scale).round() as i32
+            );
+            assert_eq!(
+                held.height(),
+                (f64::from(picture.height()) * scale).round() as i32
+            );
+            let stride = held.width() as usize * 4;
+            let mut snapshot = vec![0; stride * held.height() as usize];
+            held.download(&mut snapshot, stride);
+            let red = 40 * stride + 40 * 4;
+            assert_eq!(
+                &snapshot[red..red + 4],
+                &[0, 0, 255, 255],
+                "原生画面颜色或坐标错误"
+            );
+            frames.set(0);
+            let started = Instant::now();
+            pump(Duration::from_secs(4));
+            let fps = f64::from(frames.get()) / started.elapsed().as_secs_f64();
+            println!(
+                "PRESENT {}x{} scale={scale}: {fps:.1} FPS",
+                held.width(),
+                held.height()
+            );
+            let minimum = std::env::var("COMPUTER_USE_MIN_FPS")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(1.0);
+            assert!(fps >= minimum, "GTK 实际呈现帧率不足: {fps:.1} < {minimum}");
+            let mut after = vec![0; snapshot.len()];
+            held.download(&mut after, stride);
+            assert_eq!(snapshot, after, "GTK 仍持有的共享帧被覆盖");
+            let target = Target {
+                id: "test".into(),
+                label: "test".into(),
+                width: held.width() as u32,
+                height: held.height() as u32,
+                scale,
+            };
+            let point = picture_point(
+                &picture,
+                &target,
+                f64::from(picture.width()) / 2.0,
+                f64::from(picture.height()) / 2.0,
+            )
+            .unwrap();
+            assert!((point.x - f64::from(held.width()) / 2.0).abs() < 0.01);
+            assert!((point.y - f64::from(held.height()) / 2.0).abs() < 0.01);
+        }
+        window.set_visible(false);
+        pump(Duration::from_millis(200));
+        frames.set(0);
+        pump(Duration::from_millis(300));
+        assert_eq!(frames.get(), 0, "隐藏窗口后不能继续显示帧");
+        window.present();
+        pump(Duration::from_secs(1));
+        assert!(frames.get() > 10, "恢复显示应重新启动采集");
+        let retained = picture
+            .paintable()
+            .unwrap()
+            .downcast::<gdk::Texture>()
+            .unwrap();
+        let stride = retained.width() as usize * 4;
+        let mut before = vec![0; stride * retained.height() as usize];
+        retained.download(&mut before, stride);
+        window.close();
+        pump(Duration::from_millis(500));
+        let mut after = vec![0; before.len()];
+        retained.download(&mut after, stride);
+        assert_eq!(before, after, "采集池释放后 GTK 持有的帧仍须有效");
+    }
+
     fn check_single_allow_flow(app: &gtk::Application) {
         let policy = Arc::new(Mutex::new(Policy::default()));
         let owner = uuid::Uuid::new_v4();
